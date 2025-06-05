@@ -5,6 +5,7 @@ Improvements would come in the form of SharedArrayBuffers (requires hosted conte
 
 ### [Try it](https://codepen.io/mootytootyfrooty/pen/ogXBzwE)
 
+On the right, that's 0.006ms-0.01ms per collision step for a single particle, without offloading render and UI thread.
 ![image](https://github.com/user-attachments/assets/c74981a5-0dab-447d-84d6-ed4035ad789d)
 ![image](https://github.com/user-attachments/assets/8d45f303-3bc4-4c27-8bcc-663e41e5a803)
 ![image](https://github.com/user-attachments/assets/aa6f325f-babc-431c-acb3-140da3b700f3)
