@@ -5,7 +5,7 @@ Improvements would come in the form of SharedArrayBuffers (requires hosted conte
 
 ### [Try it](https://codepen.io/mootytootyfrooty/pen/ogXBzwE)
 
-On the right, that's 6-12 microseconds per collision step for a single particle, without offloading render and UI thread. Pretty good! We could do better. (e.g. https://developer.nvidia.com/blog/thinking-parallel-part-ii-tree-traversal-gpu/) Their tree traversal for 12.5K objects took 0.25ms, but this is on a 2012 gpu.
+On the right, that's 6-12 microseconds per collision step for a single particle, without offloading render and UI thread. Pretty good! We could do better. (e.g. https://developer.nvidia.com/blog/thinking-parallel-part-ii-tree-traversal-gpu/) Their tree traversal for 12.5K objects took 0.25ms, but this is on a 2012 gpu and also should work parallel for the number of cores the gpu supports, so we are cooked with our cpu implementation except for more minor tasks.
 
 ![image](https://github.com/user-attachments/assets/c74981a5-0dab-447d-84d6-ed4035ad789d)
 ![image](https://github.com/user-attachments/assets/8d45f303-3bc4-4c27-8bcc-663e41e5a803)
