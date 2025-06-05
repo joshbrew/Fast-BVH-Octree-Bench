@@ -1,21 +1,24 @@
 <!DOCTYPE html>
-<!-- Joshua Brewster (MIT License) -->
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
-  <title>BVH / Octree + Worker Pool</title>
+  <title>BVH / Octree + Worker Pool with Corrected Collision Logic</title>
   <style>
-    html, body {
+    html,
+    body {
       margin: 0;
       height: 100%;
       overflow: hidden;
       background: #dfe8ff;
     }
+
     #renderCanvas {
       width: 100%;
       height: 100%;
       display: block;
     }
+
     #ui {
       position: absolute;
       top: 8px;
@@ -25,282 +28,427 @@
       border-radius: 8px;
       font: 13px/1.4 sans-serif;
       box-shadow: 0 2px 6px #0004;
+      z-index: 10;
     }
+
     #ui label {
       display: block;
       margin-top: 4px;
     }
+
+    /* Collision table styling */
+    #collisionTable {
+      position: absolute;
+      bottom: 8px;
+      left: 8px;
+      width: 200px;
+      background: #ffffffcc;
+      padding: 8px;
+      border: 1px solid #888;
+      max-height: 250px;
+      overflow-y: auto;
+      font-size: 12px;
+      z-index: 10;
+    }
+
+    /* Table row pointer */
+    #collisionTable tr[data-node] {
+      cursor: pointer;
+    }
+
+    /* Highlighted row background */
+    #collisionTable tr.highlighted {
+      background-color: #ffff99;
+    }
   </style>
 </head>
+
 <body>
-<canvas id="renderCanvas"></canvas>
+  <canvas id="renderCanvas"></canvas>
 
-<div id="ui">
-  <label>Structure:
-    <select id="structure">
-      <option value="bvh">BVH (adaptive AABB)</option>
-      <option value="oct">Octree (adaptive AABB)</option>
-      <option value="octCube">Octree (cubic)</option>
-    </select>
-  </label>
-  <label>Min entities / leaf:
-    <input id="minLeaf" type="number" value="6" min="1" max="256" step="1">
-  </label>
-  <label>Point count:
-    <input id="numPts" type="number" value="10000" min="100" max="200000" step="1000">
-  </label>
-  <button id="rebuild">Re-build</button>
-  <div id="stats" style="margin-top:6px;font-size:12px"></div>
-</div>
+  <div id="ui">
+    <label>Structure:
+      <select id="structure">
+        <option value="bvh">BVH (adaptive AABB)</option>
+        <option value="oct">Octree (adaptive AABB)</option>
+        <option value="octCube">Octree (cubic)</option>
+      </select>
+    </label>
+    <label>Min entities / leaf:
+      <input id="minLeaf" type="number" value="6" min="1" max="256" step="1">
+    </label>
+    <label>Point count:
+      <input id="numPts" type="number" value="10000" min="100" max="200000" step="1000">
+    </label>
+    <button id="rebuild">Re-build</button>
+    <button id="shoot">Shoot Ball</button>
+    <div id="stats" style="margin-top:6px;font-size:12px"></div>
+  </div>
 
-<!-- ────────────── WORKER CODE (inline) ────────────── -->
-<script id="oct-worker" type="javascript/worker">
-  const EPS = Number.EPSILON;
+  <div id="collisionTable"></div>
 
-  /* -------- AABB -------- */
-  function aabb(p, s, r, idx, len) {
-    let xmin = 1e9, ymin = 1e9, zmin = 1e9;
-    let xmax = -1e9, ymax = -1e9, zmax = -1e9;
-    for (let i = 0; i < len; i++) {
-      const id = idx[i] * 3;
-      const x = p[id], y = p[id + 1], z = p[id + 2];
-      const sx = s[id], sy = s[id + 1], sz = s[id + 2];
-      const rad = r[idx[i]] || EPS;
-      const minxx = x - rad * sx, maxxx = x + rad * sx;
-      const minyy = y - rad * sy, maxyy = y + rad * sy;
-      const minzz = z - rad * sz, maxzz = z + rad * sz;
-      if (minxx < xmin) xmin = minxx;
-      if (maxxx > xmax) xmax = maxxx;
-      if (minyy < ymin) ymin = minyy;
-      if (maxyy > ymax) ymax = maxyy;
-      if (minzz < zmin) zmin = minzz;
-      if (maxzz > zmax) zmax = maxzz;
-    }
-    return [xmin, ymin, zmin, xmax, ymax, zmax];
-  }
-  function pushNode(out, cx, cy, cz, hx, hy, hz, isLeaf) {
-    out.push(cx, cy, cz, hx, hy, hz, isLeaf);
-  }
+  <!-- ────────────── WORKER CODE (inline) ────────────── -->
+  <script id="oct-worker" type="javascript/worker">
+    const EPS = Number.EPSILON;
 
-  /* -------- Iterative BVH (strict minLeaf) -------- */
-  function buildBVH(p, s, r, minLeaf, stack, out) {
-    const N = p.length / 3;
-    const root = new Uint32Array(N);
-    for (let i = 0; i < N; i++) root[i] = i;
-    stack.length = 0;
-    stack.push({ idx: root, len: N });
-    while (stack.length) {
-      const job = stack.pop();
-      const box = aabb(p, s, r, job.idx, job.len);
-      const cx = (box[0] + box[3]) * 0.5;
-      const cy = (box[1] + box[4]) * 0.5;
-      const cz = (box[2] + box[5]) * 0.5;
-      const hx = (box[3] - box[0]) * 0.5;
-      const hy = (box[4] - box[1]) * 0.5;
-      const hz = (box[5] - box[2]) * 0.5;
-      let leaf = 1;
-      if (job.len > minLeaf) {
-        const sizes = [hx * 2, hy * 2, hz * 2];
-        let axis = sizes[1] > sizes[0] ? 1 : 0;
-        axis = sizes[2] > sizes[axis] ? 2 : axis;
-        const L = [], R = [];
-        const mid = [cx, cy, cz][axis];
-        for (let i = 0; i < job.len; i++) {
-          const id = job.idx[i] * 3;
-          const v = p[id + axis];
-          (v <= mid ? L : R).push(job.idx[i]);
-        }
-        if (L.length >= minLeaf && R.length >= minLeaf) {
-          leaf = 0;
-          stack.push({ idx: new Uint32Array(R), len: R.length });
-          stack.push({ idx: new Uint32Array(L), len: L.length });
-        }
+    /* -------- AABB -------- */
+    function aabb(p, s, r, idx, len) {
+      let xmin =  1e9, ymin =  1e9, zmin =  1e9;
+      let xmax = -1e9, ymax = -1e9, zmax = -1e9;
+      for (let i = 0; i < len; i++) {
+        const id = idx[i] * 3;
+        const x = p[id],      y = p[id + 1],  z = p[id + 2];
+        const sx = s[id],     sy = s[id + 1], sz = s[id + 2];
+        const rad = r[idx[i]] || EPS;
+        const minxx = x - rad * sx, maxxx = x + rad * sx;
+        const minyy = y - rad * sy, maxyy = y + rad * sy;
+        const minzz = z - rad * sz, maxzz = z + rad * sz;
+        if (minxx < xmin) xmin = minxx;
+        if (maxxx > xmax) xmax = maxxx;
+        if (minyy < ymin) ymin = minyy;
+        if (maxyy > ymax) ymax = maxyy;
+        if (minzz < zmin) zmin = minzz;
+        if (maxzz > zmax) zmax = maxzz;
       }
-      pushNode(out, cx, cy, cz, hx, hy, hz, leaf);
+      return [xmin, ymin, zmin, xmax, ymax, zmax];
     }
-  }
+    function pushNode(out, cx, cy, cz, hx, hy, hz, isLeaf) {
+      out.push(cx, cy, cz, hx, hy, hz, isLeaf);
+    }
 
-  /* -------- Iterative Octree -------- */
-  function buildOctree(p, s, r, minLeaf, cubic, stack, out) {
-  const N = p.length / 3;
-  const root = new Uint32Array(N);
-  for (let i = 0; i < N; i++) root[i] = i;
+    /* -------- Iterative BVH with Child‐Pointers -------- */
+    function buildBVH_withChildren(p, s, r, minLeaf, out, leafIdxs, childL, childR) {
+      let jobList = [];
+      const initialIdx = new Uint32Array(p.length / 3);
+      for (let i = 0; i < p.length / 3; i++) initialIdx[i] = i;
+      const stack = [{ idx: initialIdx, len: p.length / 3, parentIndex: -1, isLeftChild: false, leaf: 0 }];
 
-  // compute root bounding box
-  let rootBox = aabb(p, s, r, root, N);
-  if (cubic) {
-    const size = Math.max(
-      rootBox[3] - rootBox[0],
-      rootBox[4] - rootBox[1],
-      rootBox[5] - rootBox[2]
-    );
-    const cx = (rootBox[0] + rootBox[3]) * 0.5;
-    const cy = (rootBox[1] + rootBox[4]) * 0.5;
-    const cz = (rootBox[2] + rootBox[5]) * 0.5;
-    rootBox = [
-      cx - size * 0.5, cy - size * 0.5, cz - size * 0.5,
-      cx + size * 0.5, cy + size * 0.5, cz + size * 0.5
-    ];
-  }
+      while (stack.length) {
+        const job = stack.pop();
+        jobList.push(job);
 
-  stack.length = 0;
-  stack.push({ idx: root, len: N, box: rootBox });
-  const counts = new Uint16Array(8);
+        const box = aabb(p, s, r, job.idx, job.len);
+        const cx = 0.5 * (box[0] + box[3]);
+        const cy = 0.5 * (box[1] + box[4]);
+        const cz = 0.5 * (box[2] + box[5]);
+        const hx = 0.5 * (box[3] - box[0]);
+        const hy = 0.5 * (box[4] - box[1]);
+        const hz = 0.5 * (box[5] - box[2]);
 
-  while (stack.length) {
-    const job = stack.pop();
-    const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
-    const cx = (minX + maxX) * 0.5;
-    const cy = (minY + maxY) * 0.5;
-    const cz = (minZ + maxZ) * 0.5;
-    const hx = (maxX - minX) * 0.5;
-    const hy = (maxY - minY) * 0.5;
-    const hz = (maxZ - minZ) * 0.5;
-
-    let leaf = 1;
-    if (job.len > minLeaf) {
-      // tally how many points fall into each of the 8 sub‐boxes
-      counts.fill(0);
-      for (let i = 0; i < job.len; i++) {
-        const id = job.idx[i] * 3;
-        let o = 0;
-        if (p[id]        > cx) o |= 1;
-        if (p[id + 1]    > cy) o |= 2;
-        if (p[id + 2]    > cz) o |= 4;
-        counts[o]++;
+        let leaf = 1;
+        if (job.len > minLeaf) {
+          const sizes = [hx * 2, hy * 2, hz * 2];
+          let axis = sizes[1] > sizes[0] ? 1 : 0;
+          axis = sizes[2] > sizes[axis] ? 2 : axis;
+          const L = [], R = [];
+          const mid = [cx, cy, cz][axis];
+          for (let i = 0; i < job.len; i++) {
+            const id = job.idx[i] * 3;
+            const v = p[id + axis];
+            (v <= mid ? L : R).push(job.idx[i]);
+          }
+          if (L.length >= minLeaf && R.length >= minLeaf) {
+            leaf = 0;
+            stack.push({ idx: new Uint32Array(R), len: R.length, parentIndex: jobList.length - 1, isLeftChild: false, leaf: 0 });
+            stack.push({ idx: new Uint32Array(L), len: L.length, parentIndex: jobList.length - 1, isLeftChild: true, leaf: 0 });
+          }
+        }
+        job.leaf = leaf;
       }
 
-      // how many octants are non‐empty?
-      let nonEmpty = 0;
-      for (const c of counts) if (c) nonEmpty++;
+      const Nnodes = jobList.length;
+      for (let i = 0; i < Nnodes; i++) {
+        jobList[i].nodeIndex = i;
+      }
+      for (let i = 0; i < Nnodes; i++) {
+        childL[i] = -1;
+        childR[i] = -1;
+      }
 
-      // SPLIT as soon as there are ≥2 non‐empty octants and parent.len > minLeaf
-      if (nonEmpty > 1) {
-        leaf = 0;
-        const offs = new Uint32Array(8);
-        for (let i = 1; i < 8; i++) offs[i] = offs[i - 1] + counts[i - 1];
+      for (let i = 0; i < Nnodes; i++) {
+        const job = jobList[i];
+        const idxArr = job.idx;
+        const len = job.len;
+        const leafFlag = job.leaf;
 
-        // pack indices into one big Uint32Array so that any subrange is contiguous
-        const packed = new Uint32Array(job.len);
-        const tmp = counts.slice();
-        for (let i = 0; i < job.len; i++) {
-          const id = job.idx[i] * 3;
-          let o = 0;
-          if (p[id]        > cx) o |= 1;
-          if (p[id + 1]    > cy) o |= 2;
-          if (p[id + 2]    > cz) o |= 4;
-          packed[offs[o] + (--tmp[o])] = job.idx[i];
+        const box = aabb(p, s, r, idxArr, len);
+        const cx = 0.5 * (box[0] + box[3]);
+        const cy = 0.5 * (box[1] + box[4]);
+        const cz = 0.5 * (box[2] + box[5]);
+        const hx = 0.5 * (box[3] - box[0]);
+        const hy = 0.5 * (box[4] - box[1]);
+        const hz = 0.5 * (box[5] - box[2]);
+
+        pushNode(out, cx, cy, cz, hx, hy, hz, leafFlag);
+        if (leafFlag) {
+          leafIdxs.push(new Uint32Array(idxArr));
         }
 
-        // create one child‐job per non‐empty octant
-        for (let o = 0; o < 8; o++) {
-          const cnt = counts[o];
-          if (cnt === 0) continue;
-          // sub is a “view” into packed’s buffer
-          const sub = new Uint32Array(packed.buffer, offs[o] * 4, cnt);
-
-          // compute that child’s bounding‐box
-          let bb;
-          if (cubic) {
-            bb = [
-              minX + (o & 1 ? hx : 0),
-              minY + (o & 2 ? hy : 0),
-              minZ + (o & 4 ? hz : 0),
-              minX + (o & 1 ? hx * 2 : hx),
-              minY + (o & 2 ? hy * 2 : hy),
-              minZ + (o & 4 ? hz * 2 : hz)
-            ];
+        if (job.parentIndex >= 0) {
+          const pIdx = jobList[job.parentIndex].nodeIndex;
+          if (job.isLeftChild) {
+            childL[pIdx] = job.nodeIndex;
           } else {
-            bb = aabb(p, s, r, sub, cnt);
+            childR[pIdx] = job.nodeIndex;
+          }
+        }
+      }
+    }
+
+    /* -------- Iterative Octree (no child pointers for now) -------- */
+    function buildOctree(p, s, r, minLeaf, cubic, stack, out) {
+      const N = p.length / 3;
+      const root = new Uint32Array(N);
+      for (let i = 0; i < N; i++) root[i] = i;
+
+      let rootBox = aabb(p, s, r, root, N);
+      if (cubic) {
+        const size = Math.max(
+          rootBox[3] - rootBox[0],
+          rootBox[4] - rootBox[1],
+          rootBox[5] - rootBox[2]
+        );
+        const cx = (rootBox[0] + rootBox[3]) * 0.5;
+        const cy = (rootBox[1] + rootBox[4]) * 0.5;
+        const cz = (rootBox[2] + rootBox[5]) * 0.5;
+        rootBox = [
+          cx - size * 0.5, cy - size * 0.5, cz - size * 0.5,
+          cx + size * 0.5, cy + size * 0.5, cz + size * 0.5
+        ];
+      }
+
+      stack.length = 0;
+      stack.push({ idx: root, len: N, box: rootBox });
+      const counts = new Uint16Array(8);
+
+      while (stack.length) {
+        const job = stack.pop();
+        const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
+        const cx = (minX + maxX) * 0.5;
+        const cy = (minY + maxY) * 0.5;
+        const cz = (minZ + maxZ) * 0.5;
+        const hx = (maxX - minX) * 0.5;
+        const hy = (maxY - minY) * 0.5;
+        const hz = (maxZ - minZ) * 0.5;
+
+        let leaf = 1;
+        if (job.len > minLeaf) {
+          counts.fill(0);
+          for (let i = 0; i < job.len; i++) {
+            const id = job.idx[i] * 3;
+            let o = 0;
+            if (p[id]      > cx) o |= 1;
+            if (p[id + 1]  > cy) o |= 2;
+            if (p[id + 2]  > cz) o |= 4;
+            counts[o]++;
           }
 
-          stack.push({ idx: sub, len: cnt, box: bb });
+          let nonEmpty = 0;
+          for (const c of counts) if (c) nonEmpty++;
+
+          if (nonEmpty > 1) {
+            leaf = 0;
+            const offs = new Uint32Array(8);
+            for (let i = 1; i < 8; i++) offs[i] = offs[i - 1] + counts[i - 1];
+
+            const packed = new Uint32Array(job.len);
+            const tmp = counts.slice();
+            for (let i = 0; i < job.len; i++) {
+              const id = job.idx[i] * 3;
+              let o = 0;
+              if (p[id]      > cx) o |= 1;
+              if (p[id + 1]  > cy) o |= 2;
+              if (p[id + 2]  > cz) o |= 4;
+              packed[offs[o] + (--tmp[o])] = job.idx[i];
+            }
+
+            for (let o = 0; o < 8; o++) {
+              const cnt = counts[o];
+              if (cnt === 0) continue;
+              const sub = new Uint32Array(packed.buffer, offs[o] * 4, cnt);
+
+              let bb;
+              if (cubic) {
+                bb = [
+                  minX + (o & 1 ? hx : 0),
+                  minY + (o & 2 ? hy : 0),
+                  minZ + (o & 4 ? hz : 0),
+                  minX + (o & 1 ? hx * 2 : hx),
+                  minY + (o & 2 ? hy * 2 : hy),
+                  minZ + (o & 4 ? hz * 2 : hz)
+                ];
+              } else {
+                bb = aabb(p, s, r, sub, cnt);
+              }
+
+              stack.push({ idx: sub, len: cnt, box: bb });
+            }
+          }
         }
+
+        pushNode(out, cx, cy, cz, hx, hy, hz, leaf);
       }
     }
 
-    // finally, record this node (whether leaf or interior)
-    pushNode(out, cx, cy, cz, hx, hy, hz, leaf);
-  }
-}
+    /* -------- Worker API -------- */
+    self.onmessage = e => {
+      const { version, structure, minLeaf, pos, scl, rad, cubic } = e.data;
+      const raw = [];
+      const leafIdxs = [];
 
+      if (structure === "bvh") {
+        // Estimate node count by building a temporary job list
+        let jobList = [];
+        const initIdx = new Uint32Array(pos.length / 3);
+        for (let i = 0; i < pos.length / 3; i++) initIdx[i] = i;
+        const stackTemp = [{ idx: initIdx, len: pos.length / 3, parentIndex: -1, isLeftChild: false, leaf: 0 }];
+        while (stackTemp.length) {
+          const job = stackTemp.pop();
+          jobList.push(job);
+          const box = aabb(pos, scl, rad, job.idx, job.len);
+          const cx = 0.5 * (box[0] + box[3]);
+          const cy = 0.5 * (box[1] + box[4]);
+          const cz = 0.5 * (box[2] + box[5]);
+          const hx = 0.5 * (box[3] - box[0]);
+          const hy = 0.5 * (box[4] - box[1]);
+          const hz = 0.5 * (box[5] - box[2]);
 
-  /* -------- Worker API -------- */
-  self.onmessage = e => {
-    const { version, structure, minLeaf, pos, scl, rad, cubic } = e.data;
-    const stack = [], raw = [];
-    const t0 = performance.now();
-    if (structure === "bvh") {
-      buildBVH(pos, scl, rad, minLeaf, stack, raw);
-    } else {
-      buildOctree(pos, scl, rad, minLeaf, cubic, stack, raw);
-    }
-    const ms = performance.now() - t0;
+          let leaf = 1;
+          if (job.len > minLeaf) {
+            const sizes = [hx * 2, hy * 2, hz * 2];
+            let axis = sizes[1] > sizes[0] ? 1 : 0;
+            axis = sizes[2] > sizes[axis] ? 2 : axis;
+            const L = [], R = [];
+            const mid = [cx, cy, cz][axis];
+            for (let i = 0; i < job.len; i++) {
+              const id = job.idx[i] * 3;
+              const v = pos[id + axis];
+              (v <= mid ? L : R).push(job.idx[i]);
+            }
+            if (L.length >= minLeaf && R.length >= minLeaf) {
+              leaf = 0;
+              stackTemp.push({ idx: new Uint32Array(R), len: R.length, parentIndex: jobList.length - 1, isLeftChild: false, leaf: 0 });
+              stackTemp.push({ idx: new Uint32Array(L), len: L.length, parentIndex: jobList.length - 1, isLeftChild: true, leaf: 0 });
+            }
+          }
+          job.leaf = leaf;
+        }
+        const Nnodes = jobList.length;
+        const childL = new Int32Array(Nnodes);
+        const childR = new Int32Array(Nnodes);
 
-    const n = raw.length / 7;
-    const data = new Float32Array(n * 6);
-    const leaf = new Uint8Array(n);
-    for (let i = 0; i < n; i++) {
-      const o = i * 7, d = i * 6;
-      data[d]     = raw[o];
-      data[d + 1] = raw[o + 1];
-      data[d + 2] = raw[o + 2];
-      data[d + 3] = raw[o + 3];
-      data[d + 4] = raw[o + 4];
-      data[d + 5] = raw[o + 5];
-      leaf[i]     = raw[o + 6];
-    }
+        buildBVH_withChildren(pos, scl, rad, minLeaf, raw, leafIdxs, childL, childR);
 
-    self.postMessage({ version, buildTime: ms, data, leaf }, [data.buffer, leaf.buffer]);
-  };
-</script>
-<!-- ────────────── /worker ────────────── -->
+        const data = new Float32Array(Nnodes * 6);
+        const leafArr = new Uint8Array(Nnodes);
+        for (let i = 0; i < Nnodes; i++) {
+          const o = i * 7, d = i * 6;
+          data[d]     = raw[o];
+          data[d + 1] = raw[o + 1];
+          data[d + 2] = raw[o + 2];
+          data[d + 3] = raw[o + 3];
+          data[d + 4] = raw[o + 4];
+          data[d + 5] = raw[o + 5];
+          leafArr[i]  = raw[o + 6];
+        }
 
-<script src="https://cdn.jsdelivr.net/npm/babylonjs@6.39.0/babylon.js"></script>
-<script>
+        self.postMessage(
+          {
+            version,
+            buildTime: performance.now() - e.data.t0,
+            data,        // Float32Array(6*Nnodes)
+            leaf: leafArr,// Uint8Array(Nnodes)
+            childL,      // Int32Array(Nnodes)
+            childR,      // Int32Array(Nnodes)
+            leafIdxs     // Array<Uint32Array>
+          },
+          [data.buffer, leafArr.buffer, childL.buffer, childR.buffer, ...leafIdxs.map(a => a.buffer)]
+        );
+      } else {
+        // Build octree without child pointers
+        const stack = [], outArr = [], leafIdxsLocal = [];
+        buildOctree(pos, scl, rad, minLeaf, cubic, stack, outArr);
+        const Nnodes = outArr.length / 7;
+        const data = new Float32Array(Nnodes * 6);
+        const leafArr = new Uint8Array(Nnodes);
+        for (let i = 0; i < Nnodes; i++) {
+          const o = i * 7, d = i * 6;
+          data[d]     = outArr[o];
+          data[d + 1] = outArr[o + 1];
+          data[d + 2] = outArr[o + 2];
+          data[d + 3] = outArr[o + 3];
+          data[d + 4] = outArr[o + 4];
+          data[d + 5] = outArr[o + 5];
+          leafArr[i]  = outArr[o + 6];
+        }
+        const childL = new Int32Array(Nnodes).fill(-1);
+        const childR = new Int32Array(Nnodes).fill(-1);
+        self.postMessage(
+          {
+            version,
+            buildTime: performance.now() - e.data.t0,
+            data,
+            leaf: leafArr,
+            childL,
+            childR,
+            leafIdxs: leafIdxsLocal
+          },
+          [data.buffer, leafArr.buffer, childL.buffer, childR.buffer]
+        );
+      }
+    };
+  </script>
+  <!-- ────────────── /worker ────────────── -->
+
+  <script src="https://cdn.jsdelivr.net/npm/babylonjs@6.39.0/babylon.js"></script>
+  <script>
     /* ---------- Babylon scene ---------- */
     const canvas = document.getElementById("renderCanvas");
     const engine = new BABYLON.Engine(canvas, true);
-    const scene  = new BABYLON.Scene(engine);
+    const scene = new BABYLON.Scene(engine);
     scene.clearColor.set(0.9, 0.9, 0.95);
-  
+
     const cam = new BABYLON.ArcRotateCamera(
       "cam", Math.PI / 4, Math.PI / 4, 300, BABYLON.Vector3.Zero(), scene
     );
     cam.attachControl(canvas, true);
     new BABYLON.HemisphericLight("L", new BABYLON.Vector3(0, 1, 0), scene)
       .intensity = 0.9;
-  
+
     /* ---------- materials -------------------------------------------------- */
     const matLeaf = new BABYLON.StandardMaterial("leafM", scene);
     matLeaf.diffuseColor.set(0.1, 0.8, 0.1);
-    matLeaf.alpha             = 0.1;    // translucent
-  
+    matLeaf.alpha = 0.1;
+
     const matInt = new BABYLON.StandardMaterial("intM", scene);
     matInt.diffuseColor.set(1, 0, 0);
-    matInt.alpha             = 0.01;     // very translucent
-  
+    matInt.alpha = 0.01;
+
     const matPt = new BABYLON.StandardMaterial("ptM", scene);
     matPt.diffuseColor.set(0, 0, 0.8);
-    matPt.forceDepthWrite  = true;       // ensure points overwrite any cube color
-    matPt.backFaceCulling  = false;
-  
+    matPt.forceDepthWrite = true;
+    matPt.backFaceCulling = false;
+
+    const matHighlight = new BABYLON.StandardMaterial("highlightM", scene);
+    matHighlight.diffuseColor.set(1, 1, 0); // yellow
+    matHighlight.alpha = 1.0;              // fully opaque
+
     /* ---------- template meshes & rendering groups ------------------------- */
     const leafT = BABYLON.MeshBuilder.CreateBox("leafT", { size: 1 }, scene);
     leafT.material = matLeaf;
     leafT.setEnabled(false);
-    leafT.renderingGroupId = 1;         // draw cubes in group 1 (transparent pass)
-  
+    leafT.renderingGroupId = 1;
+
     const intT = BABYLON.MeshBuilder.CreateBox("intT", { size: 1 }, scene);
     intT.material = matInt;
     intT.setEnabled(false);
-    intT.renderingGroupId = 1;          // draw cubes in group 1
-  
+    intT.renderingGroupId = 1;
+
     const ptT = BABYLON.MeshBuilder.CreateSphere("ptT", { diameter: 1 }, scene);
     ptT.material = matPt;
     ptT.setEnabled(false);
-    ptT.renderingGroupId = 0;           // draw points first in group 0 (opaque pass)
-  
+    ptT.renderingGroupId = 0;
+
     /* ---------- instancing helper ------------------------------------------- */
     const leafInst = [], intInst = [], ptInst = [];
     function ensure(arr, tmpl, n) {
@@ -311,28 +459,28 @@
         arr[i].setEnabled(i < n);
       }
     }
-  
+
     /* ---------- point generator ------------------------------------------- */
     function genPoints(n) {
       const pos = new Float32Array(n * 3),
-            scl = new Float32Array(n * 3),
-            rad = new Float32Array(n);
+        scl = new Float32Array(n * 3),
+        rad = new Float32Array(n);
       for (let i = 0; i < n; i++) {
         const o = i * 3;
-        pos[o]   = Math.random() * 200 - 100;
-        pos[o+1] = Math.random() * 200 - 100;
-        pos[o+2] = Math.random() * 200 - 100;
-        scl[o] = scl[o+1] = scl[o+2] = 1;
+        pos[o] = Math.random() * 200 - 100;
+        pos[o + 1] = Math.random() * 200 - 100;
+        pos[o + 2] = Math.random() * 200 - 100;
+        scl[o] = scl[o + 1] = scl[o + 2] = 1;
         rad[i] = 1;
       }
       return { pos, scl, rad };
     }
     let currentPts = null;
-  
+
     /* ---------- worker-pool ------------------------------------------------ */
     const workerURL = URL.createObjectURL(
       new Blob([document.getElementById("oct-worker").textContent],
-               { type: "application/javascript" })
+        { type: "application/javascript" })
     );
     class WorkerPool {
       constructor(url, max = 8) {
@@ -360,52 +508,100 @@
         const { msg, cb } = this.queue.shift();
         const w = this.free.pop();
         w._cb = cb;
-        w.postMessage(msg, [ msg.pos.buffer, msg.scl.buffer, msg.rad.buffer ]);
+        msg.t0 = performance.now();
+        w.postMessage(msg, [msg.pos.buffer, msg.scl.buffer, msg.rad.buffer]);
       }
     }
     const pool = new WorkerPool(workerURL, 8);
     const runWorker = (task, cb) => pool.run(task, cb);
-  
+
+    /* ---------- BVH data & leaf records ----------------------------------- */
+    let nodeData = null;   // Float32Array: [cx, cy, cz, hx, hy, hz] × nodeCount
+    let isLeafArr = null;   // Uint8Array: leaf=1 / internal=0
+    let childLArr = null;   // Int32Array: left child index or -1
+    let childRArr = null;   // Int32Array: right child index or -1
+    let leafIndicesArray = null;   // Array<Uint32Array>: indices per leaf
+    let leafNodesRecords = [];     // [{min:[x,y,z], max:[x,y,z], indices:Uint32Array, nodeIndex}, …]
+    let highlightedLeafIndex = null;   // currently highlighted node index
+
+    /* ---------- collision info table container ----------------------------- */
+    const collisionDiv = document.getElementById("collisionTable");
+
+    /* ---------- single “highlight box” (non-instanced) -------------------- */
+    let highlightBoxMesh = null;
+
     /* ---------- UI & rebuild ---------------------------------------------- */
-    const sel   = document.getElementById("structure");
+    const sel = document.getElementById("structure");
     const minIn = document.getElementById("minLeaf");
     const numIn = document.getElementById("numPts");
     const stats = document.getElementById("stats");
     document.getElementById("rebuild").onclick = rebuild;
-  
+    document.getElementById("shoot").onclick = shootBall;
+
     let version = 0;
     rebuild();
-  
+
     function rebuild() {
       const n = +numIn.value;
       currentPts = genPoints(n);
-      console.log("Generated currentPts.pos.length:", currentPts.pos.length); // should be n*3
       version++;
-  
-      // Copy before sending, so main-thread arrays remain intact
+
       const posCopy = new Float32Array(currentPts.pos);
       const sclCopy = new Float32Array(currentPts.scl);
       const radCopy = new Float32Array(currentPts.rad);
-  
+
       runWorker({
         version,
-        structure : sel.value,
-        cubic     : sel.value === "octCube",
-        minLeaf   : +minIn.value,
+        structure: sel.value,
+        cubic: sel.value === "octCube",
+        minLeaf: +minIn.value,
         pos: posCopy,
         scl: sclCopy,
         rad: radCopy
       }, e => {
         if (e.data.version !== version) return;  // ignore stale
-        const { data, leaf, buildTime } = e.data;
-        const nodeN = leaf.length;
-        const nPts  = currentPts.pos.length / 3;
-        console.log("Inside callback, nPts =", nPts); // now logs correctly
-  
-        /* ---- spheres (group 0, opaque pass) ---- */
+
+        const { data, leaf, childL, childR, buildTime, leafIdxs } = e.data;
+        const nodeCount = leaf.length;
+        const nPts = currentPts.pos.length / 3;
+
+        nodeData = data;           // Float32Array(6 * nodeCount)
+        isLeafArr = leaf;           // Uint8Array(nodeCount)
+        childLArr = childL;         // Int32Array(nodeCount)
+        childRArr = childR;         // Int32Array(nodeCount)
+        leafIndicesArray = leafIdxs;       // Array<Uint32Array>
+
+        // Build leafNodesRecords (with nodeIndex)
+        leafNodesRecords = [];
+        let leafCounter = 0;
+        for (let i = 0; i < nodeCount; i++) {
+          if (isLeafArr[i] === 1) {
+            const d = i * 6;
+            const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
+            const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
+            const minX = cx - hx, minY = cy - hy, minZ = cz - hz;
+            const maxX = cx + hx, maxY = cy + hy, maxZ = cz + hz;
+            leafNodesRecords.push({
+              min: [minX, minY, minZ],
+              max: [maxX, maxY, maxZ],
+              indices: leafIndicesArray[leafCounter++] || new Uint32Array(),
+              nodeIndex: i
+            });
+          }
+        }
+
+        // Dispose old highlight box
+        if (highlightBoxMesh) {
+          highlightBoxMesh.dispose();
+          highlightBoxMesh = null;
+        }
+        highlightedLeafIndex = null;
+
+        // Populate point cloud
         ensure(ptInst, ptT, nPts);
         for (let i = 0; i < nPts; i++) {
-          const m = ptInst[i], b = i * 3;
+          const m = ptInst[i];
+          const b = i * 3;
           m.position.set(
             currentPts.pos[b],
             currentPts.pos[b + 1],
@@ -413,34 +609,271 @@
           );
           m.scaling.set(2, 2, 2);
         }
-  
-        /* ---- cubes (group 1, transparent pass) ---- */
+
+        // Populate BVH cubes (leaf and internal)
         let leafCnt = 0, intCnt = 0;
-        for (const f of leaf) {
+        for (const f of isLeafArr) {
           if (f) leafCnt++;
-          else   intCnt++;
+          else intCnt++;
         }
         ensure(leafInst, leafT, leafCnt);
-        ensure(intInst, intT,  intCnt);
-  
+        ensure(intInst, intT, intCnt);
+
         let li = 0, ii = 0;
-        for (let i = 0; i < nodeN; i++) {
+        for (let i = 0; i < nodeCount; i++) {
           const d = i * 6;
-          const cx = data[d], cy = data[d + 1], cz = data[d + 2],
-                hx = data[d + 3], hy = data[d + 4], hz = data[d + 5];
-          const inst = leaf[i] ? leafInst[li++] : intInst[ii++];
+          const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
+          const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
+          const inst = isLeafArr[i] ? leafInst[li++] : intInst[ii++];
           inst.position.set(cx, cy, cz);
           inst.scaling.set(hx * 2, hy * 2, hz * 2);
         }
-  
+
         stats.textContent =
-          `Nodes: ${nodeN.toLocaleString()}  |  Build ${buildTime.toFixed(2)} ms`;
+          `Nodes: ${nodeCount.toLocaleString()}  |  Build ${buildTime.toFixed(2)} ms`;
+
+        collisionDiv.innerHTML = "";
       });
     }
-  
+
+    /* ---------- Ball & Collision Logic ------------------------------------ */
+    let ballMesh = null;
+    let ballVelocity = new BABYLON.Vector3();
+    const ballSpeed = 200;          // units/sec
+    const ballRadius = 2;            // sphere diameter=4
+    let isBallActive = false;
+    let ballSpawnTime = 0;
+    const ballMaxLifetime = 5000;     // ms
+
+    function shootBall() {
+      if (!nodeData) {
+        console.warn("BVH not built yet. Rebuild and try again.");
+        return;
+      }
+
+      // Dispose old ball
+      if (ballMesh) {
+        ballMesh.dispose();
+        isBallActive = false;
+      }
+
+      // Create new ball at camera
+      const camPos = cam.position.clone();
+      ballMesh = BABYLON.MeshBuilder.CreateSphere("ball", { diameter: ballRadius * 2 }, scene);
+      ballMesh.position.copyFrom(camPos);
+      ballMesh.material = new BABYLON.StandardMaterial("ballMat", scene);
+      ballMesh.material.diffuseColor.set(0.8, 0.2, 0.2);
+      ballMesh.renderingGroupId = 0;
+
+      // Direction from camera to target
+      const dir = cam.target.clone().subtract(camPos).normalize();
+      ballVelocity = dir.scale(ballSpeed);
+
+      ballSpawnTime = performance.now();
+      isBallActive = true;
+
+      // Clear previous info/highlight
+      collisionDiv.innerHTML = "";
+      if (highlightBoxMesh) {
+        highlightBoxMesh.dispose();
+        highlightBoxMesh = null;
+        highlightedLeafIndex = null;
+      }
+    }
+
+    scene.registerBeforeRender(() => {
+      if (!isBallActive || !ballMesh) return;
+
+      const now = performance.now();
+      if (now - ballSpawnTime >= ballMaxLifetime) {
+        ballMesh.dispose();
+        isBallActive = false;
+        return;
+      }
+
+      const delta = engine.getDeltaTime() / 1000;
+      ballMesh.position.addInPlace(ballVelocity.scale(delta));
+
+      console.time("Tree Traversal");
+      // --- Find collided leaf (O(#leaves)) ---
+      let collidedLeafRecord = null;
+      for (const rec of leafNodesRecords) {
+        const [minX, minY, minZ] = rec.min;
+        const [maxX, maxY, maxZ] = rec.max;
+        if (
+          ballMesh.position.x >= minX && ballMesh.position.x <= maxX &&
+          ballMesh.position.y >= minY && ballMesh.position.y <= maxY &&
+          ballMesh.position.z >= minZ && ballMesh.position.z <= maxZ
+        ) {
+          collidedLeafRecord = rec;
+          break;
+        }
+      }
+      if (!collidedLeafRecord) {
+        // Not yet inside any leaf
+        console.timeEnd("Tree Traversal");
+        return;
+      }
+
+      const collidedLeafNodeIndex = collidedLeafRecord.nodeIndex;
+
+      // --- Check particles in that leaf for actual collision ---
+      const indices = collidedLeafRecord.indices;
+      let particleHit = -1;
+      const pxArr = currentPts.pos;
+      const prArr = currentPts.rad;
+      const pos = ballMesh.position;
+      for (let i = 0; i < indices.length; i++) {
+        const idx = indices[i];
+        const px = pxArr[3 * idx];
+        const py = pxArr[3 * idx + 1];
+        const pz = pxArr[3 * idx + 2];
+        const dx = pos.x - px;
+        const dy = pos.y - py;
+        const dz = pos.z - pz;
+        const distSq = dx * dx + dy * dy + dz * dz;
+        const radiusSum = ballRadius + prArr[idx];
+        if (distSq <= radiusSum * radiusSum) {
+          particleHit = idx;
+          break;
+        }
+      }
+      console.timeEnd("Tree Traversal");
+      if (particleHit < 0) {
+        // No orb‐collision yet; continue traveling
+        // Optionally highlight current leaf
+        if (highlightBoxMesh && highlightedLeafIndex !== collidedLeafNodeIndex) {
+          highlightBoxMesh.dispose();
+          highlightBoxMesh = null;
+        }
+        if (!highlightBoxMesh || highlightedLeafIndex !== collidedLeafNodeIndex) {
+          const d = collidedLeafNodeIndex * 6;
+          const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
+          const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
+          highlightBoxMesh = BABYLON.MeshBuilder.CreateBox(
+            "highlightBox",
+            { width: hx * 2, height: hy * 2, depth: hz * 2 },
+            scene
+          );
+          highlightBoxMesh.position.set(cx, cy, cz);
+          highlightBoxMesh.material = matHighlight;
+          highlightBoxMesh.renderingGroupId = 1;
+          highlightedLeafIndex = collidedLeafNodeIndex;
+        }
+        return;
+      }
+
+      // --- Actual orb collision occurred! Build hierarchy path (O(depth)) ---
+      function collectHierarchy(point) {
+        const path = [];
+        function recurse(nodeIndex) {
+          path.push(nodeIndex);
+          if (isLeafArr[nodeIndex] === 0) {
+            const L = childLArr[nodeIndex];
+            if (L >= 0) {
+              const ld = L * 6;
+              const lcX = nodeData[ld], lcY = nodeData[ld + 1], lcZ = nodeData[ld + 2];
+              const lhX = nodeData[ld + 3], lhY = nodeData[ld + 4], lhZ = nodeData[ld + 5];
+              if (
+                point.x >= lcX - lhX && point.x <= lcX + lhX &&
+                point.y >= lcY - lhY && point.y <= lcY + lhY &&
+                point.z >= lcZ - lhZ && point.z <= lcZ + lhZ
+              ) {
+                recurse(L);
+                return;
+              }
+            }
+            const R = childRArr[nodeIndex];
+            if (R >= 0) {
+              const rd = R * 6;
+              const rcX = nodeData[rd], rcY = nodeData[rd + 1], rcZ = nodeData[rd + 2];
+              const rhX = nodeData[rd + 3], rhY = nodeData[rd + 4], rhZ = nodeData[rd + 5];
+              if (
+                point.x >= rcX - rhX && point.x <= rcX + rhX &&
+                point.y >= rcY - rhY && point.y <= rcY + rhY &&
+                point.z >= rcZ - rhZ && point.z <= rcZ + rhZ
+              ) {
+                recurse(R);
+                return;
+              }
+            }
+          }
+        }
+        recurse(0);
+        return path;
+      }
+
+      const hierarchyPath = collectHierarchy(ballMesh.position);
+
+      // --- Build HTML table from hierarchyPath ---
+      let html = `
+        <table border="1" cellpadding="4" style="width:100%; text-align:center;">
+          <tr><th>Node Index</th></tr>
+      `;
+      hierarchyPath.forEach(idx => {
+        html += `<tr data-node="${idx}"><td>${idx}</td></tr>`;
+      });
+      html += `</table>`;
+      collisionDiv.innerHTML = html;
+
+      // --- Attach hover listeners to rows ---
+      const rows = collisionDiv.querySelectorAll("tr[data-node]");
+      rows.forEach(row => {
+        const nodeIdx = parseInt(row.getAttribute("data-node"));
+        row.addEventListener("mouseenter", () => {
+          if (highlightBoxMesh && highlightedLeafIndex !== nodeIdx) {
+            highlightBoxMesh.dispose();
+            highlightBoxMesh = null;
+          }
+          if (!highlightBoxMesh || highlightedLeafIndex !== nodeIdx) {
+            const d = nodeIdx * 6;
+            const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
+            const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
+            highlightBoxMesh = BABYLON.MeshBuilder.CreateBox(
+              "highlightBox",
+              { width: hx * 2, height: hy * 2, depth: hz * 2 },
+              scene
+            );
+            highlightBoxMesh.position.set(cx, cy, cz);
+            highlightBoxMesh.material = matHighlight;
+            highlightBoxMesh.renderingGroupId = 1;
+            highlightedLeafIndex = nodeIdx;
+          }
+          row.classList.add("highlighted");
+        });
+        row.addEventListener("mouseleave", () => {
+          // Revert to collided leaf highlight
+          if (highlightBoxMesh && highlightedLeafIndex !== collidedLeafNodeIndex) {
+            highlightBoxMesh.dispose();
+            highlightBoxMesh = null;
+          }
+          if (!highlightBoxMesh || highlightedLeafIndex !== collidedLeafNodeIndex) {
+            const d = collidedLeafNodeIndex * 6;
+            const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
+            const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
+            highlightBoxMesh = BABYLON.MeshBuilder.CreateBox(
+              "highlightBox",
+              { width: hx * 2, height: hy * 2, depth: hz * 2 },
+              scene
+            );
+            highlightBoxMesh.position.set(cx, cy, cz);
+            highlightBoxMesh.material = matHighlight;
+            highlightBoxMesh.renderingGroupId = 1;
+            highlightedLeafIndex = collidedLeafNodeIndex;
+          }
+          row.classList.remove("highlighted");
+        });
+      });
+
+      // Destroy the ball
+      ballMesh.dispose();
+      isBallActive = false;
+    });
+
     /* ---------- render loop ---------------------------------------------- */
     engine.runRenderLoop(() => scene.render());
     window.addEventListener("resize", () => engine.resize());
   </script>
 </body>
+
 </html>
