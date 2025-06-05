@@ -5,6 +5,7 @@ Improvements would come in the form of SharedArrayBuffers (requires hosted conte
 
 ### [Try it](https://codepen.io/mootytootyfrooty/pen/ogXBzwE)
 
-![image](https://github.com/user-attachments/assets/b7e26dcd-9452-4b0b-83dd-5bf0c22b7328)
-![image](https://github.com/user-attachments/assets/d4e4b2d4-bac9-4448-a9c5-8d3beb18c931)
-![image](https://github.com/user-attachments/assets/ff8d2d12-c4ad-48b0-bb0c-fa1e1e8fde74)
+![image](https://github.com/user-attachments/assets/c74981a5-0dab-447d-84d6-ed4035ad789d)
+![image](https://github.com/user-attachments/assets/8d45f303-3bc4-4c27-8bcc-663e41e5a803)
+![image](https://github.com/user-attachments/assets/aa6f325f-babc-431c-acb3-140da3b700f3)
+
