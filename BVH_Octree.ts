@@ -6,9 +6,9 @@
  *  - buildOctree(...) → constructs a (pointer‐free) octree, returning explicit children‐lists
  *
  * In addition, we expose:
- *  - findLeafBVH(...)         → descent BVH to find a leaf index for a query point
+ *  - findLeafBVH(...)         → descend BVH to find a leaf index for a query point
  *  - collectHierarchyBVH(...) → return full root‐to‐leaf node‐index path in BVH
- *  - findLeafOctree(...)         → descent Octree to find a leaf index for a query point
+ *  - findLeafOctree(...)         → descend Octree to find a leaf index for a query point
  *  - collectHierarchyOctree(...) → return full root‐to‐leaf node‐index path in Octree
  */
 
@@ -529,15 +529,24 @@ export function findLeafBVH(
   childR: Int32Array,
   x: number, y: number, z: number
 ): number {
+  // First check root AABB
+  const cx0 = data[0], cy0 = data[1], cz0 = data[2];
+  const hx0 = data[3], hy0 = data[4], hz0 = data[5];
+  if (
+    x < cx0 - hx0 || x > cx0 + hx0 ||
+    y < cy0 - hy0 || y > cy0 + hy0 ||
+    z < cz0 - hz0 || z > cz0 + hz0
+  ) {
+    return -1;
+  }
+
   let nodeIdx = 0;
   while (true) {
-    // Check if leaf
     if (leafFlags[nodeIdx] === 1) {
-      // We still should verify (x,y,z) is inside this leaf’s AABB—
-      // but if construction is correct, once you get here you know it was contained.
       return nodeIdx;
     }
-    // Otherwise, test left child first
+
+    // Check left child
     const L = childL[nodeIdx];
     if (L >= 0) {
       const ld = L * 6;
@@ -552,7 +561,8 @@ export function findLeafBVH(
         continue;
       }
     }
-    // Otherwise, try right child
+
+    // Otherwise, check right child
     const R = childR[nodeIdx];
     if (R >= 0) {
       const rd = R * 6;
@@ -567,7 +577,8 @@ export function findLeafBVH(
         continue;
       }
     }
-    // If neither child contains the point, we are outside the entire root or rounding error
+
+    // If neither child contains the point, we are outside
     return -1;
   }
 }
@@ -595,26 +606,26 @@ export function collectHierarchyBVH(
   x: number, y: number, z: number
 ): number[] {
   const path: number[] = [];
-  let nodeIdx = 0;
 
-  // First check root:
-  const rd0 = 0;
-  const cx0 = data[rd0], cy0 = data[rd0 + 1], cz0 = data[rd0 + 2];
-  const hx0 = data[rd0 + 3], hy0 = data[rd0 + 4], hz0 = data[rd0 + 5];
+  // Check root AABB
+  const cx0 = data[0], cy0 = data[1], cz0 = data[2];
+  const hx0 = data[3], hy0 = data[4], hz0 = data[5];
   if (
     x < cx0 - hx0 || x > cx0 + hx0 ||
     y < cy0 - hy0 || y > cy0 + hy0 ||
     z < cz0 - hz0 || z > cz0 + hz0
   ) {
-    return []; // outside the root entirely
+    return [];
   }
 
+  let nodeIdx = 0;
   while (true) {
     path.push(nodeIdx);
     if (leafFlags[nodeIdx] === 1) {
       break;
     }
-    // check left child
+
+    // Try left child
     const L = childL[nodeIdx];
     if (L >= 0) {
       const ld = L * 6;
@@ -629,7 +640,8 @@ export function collectHierarchyBVH(
         continue;
       }
     }
-    // otherwise, right child
+
+    // Otherwise, try right child
     const R = childR[nodeIdx];
     if (R >= 0) {
       const rd = R * 6;
@@ -644,7 +656,8 @@ export function collectHierarchyBVH(
         continue;
       }
     }
-    // If neither child matches (rounding or outside), we stop
+
+    // If neither child contains the point, we stop
     break;
   }
 
@@ -670,12 +683,9 @@ export function findLeafOctree(
   childrenIdxs: Uint32Array[],
   x: number, y: number, z: number
 ): number {
-  let nodeIdx = 0;
-
-  // First verify the root contains (x,y,z):
-  const rd0 = 0;
-  const cx0 = data[rd0], cy0 = data[rd0 + 1], cz0 = data[rd0 + 2];
-  const hx0 = data[rd0 + 3], hy0 = data[rd0 + 4], hz0 = data[rd0 + 5];
+  // Check root AABB
+  const cx0 = data[0], cy0 = data[1], cz0 = data[2];
+  const hx0 = data[3], hy0 = data[4], hz0 = data[5];
   if (
     x < cx0 - hx0 || x > cx0 + hx0 ||
     y < cy0 - hy0 || y > cy0 + hy0 ||
@@ -684,6 +694,7 @@ export function findLeafOctree(
     return -1;
   }
 
+  let nodeIdx = 0;
   while (true) {
     if (leafFlags[nodeIdx] === 1) {
       return nodeIdx;
@@ -731,12 +742,10 @@ export function collectHierarchyOctree(
   x: number, y: number, z: number
 ): number[] {
   const path: number[] = [];
-  let nodeIdx = 0;
 
-  // First check root
-  const rd0 = 0;
-  const cx0 = data[rd0],   cy0 = data[rd0 + 1], cz0 = data[rd0 + 2];
-  const hx0 = data[rd0 + 3], hy0 = data[rd0 + 4], hz0 = data[rd0 + 5];
+  // Check root AABB
+  const cx0 = data[0], cy0 = data[1], cz0 = data[2];
+  const hx0 = data[3], hy0 = data[4], hz0 = data[5];
   if (
     x < cx0 - hx0 || x > cx0 + hx0 ||
     y < cy0 - hy0 || y > cy0 + hy0 ||
@@ -745,6 +754,7 @@ export function collectHierarchyOctree(
     return [];
   }
 
+  let nodeIdx = 0;
   while (true) {
     path.push(nodeIdx);
     if (leafFlags[nodeIdx] === 1) {
@@ -755,7 +765,7 @@ export function collectHierarchyOctree(
     for (let i = 0, len = children.length; i < len; i++) {
       const c = children[i];
       const cd = c * 6;
-      const cx = data[cd],   cy = data[cd + 1], cz = data[cd + 2];
+      const cx = data[cd], cy = data[cd + 1], cz = data[cd + 2];
       const hx = data[cd + 3], hy = data[cd + 4], hz = data[cd + 5];
       if (
         x >= cx - hx && x <= cx + hx &&
@@ -777,8 +787,9 @@ export function collectHierarchyOctree(
 
 
 /*
+Example Usage:
 
-import { buildBVH, buildOctree } from "./bvhOctreeUtil";
+import { buildBVH, buildOctree, findLeafBVH, collectHierarchyBVH, findLeafOctree, collectHierarchyOctree } from "./bvhOctreeUtil";
 
 // Suppose you have N points with:
 //   pos  = Float32Array.of(x0, y0, z0,  x1, y1, z1,  …);
@@ -794,11 +805,43 @@ const bvhResult = buildBVH(pos, scl, rad, minLeaf);
 // bvhResult.childR   → Int32Array([3, 4, -1, -1, …])
 // bvhResult.leafIndices → e.g. [Uint32Array([idxA, idxB,…]), …]
 
+const leafIndex = findLeafBVH(
+  bvhResult.data,
+  bvhResult.leafFlags,
+  bvhResult.childL,
+  bvhResult.childR,
+  queryX, queryY, queryZ
+);
+// leafIndex is the index of the leaf in which (queryX,queryY,queryZ) lies (or -1)
+
+const pathBVH = collectHierarchyBVH(
+  bvhResult.data,
+  bvhResult.leafFlags,
+  bvhResult.childL,
+  bvhResult.childR,
+  queryX, queryY, queryZ
+);
+// pathBVH is an array of node indices from root (0) through the leaf
+
 const cubic = true;
 const octResult = buildOctree(pos, scl, rad, minLeaf, cubic);
 // octResult.data       → Float32Array([cx0, cy0, cz0, hx0, hy0, hz0,  cx1, …])
 // octResult.leafFlags  → Uint8Array([0, 1, 1, 0, …])
 // octResult.childL/R   → all −1 (no pointers)
 // octResult.leafIndices → Array<Uint32Array> with one entry per octree leaf
+// octResult.childrenIdxs → Array<Uint32Array> giving up to 8 children per node
 
+const leafIndexOct = findLeafOctree(
+  octResult.data,
+  octResult.leafFlags,
+  octResult.childrenIdxs,
+  queryX, queryY, queryZ
+);
+
+const pathOct = collectHierarchyOctree(
+  octResult.data,
+  octResult.leafFlags,
+  octResult.childrenIdxs,
+  queryX, queryY, queryZ
+);
 */
