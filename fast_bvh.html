@@ -263,149 +263,163 @@
     }
   
     /** Build a (pointer-free) Octree over points */
-    function buildOctree(p, s, r, minLeaf, cubic) {
-      const N = p.length / 3;
-      if (N === 0) {
-        return {
-          data: new Float32Array(0),
-          leafFlags: new Uint8Array(0),
-          childL: new Int32Array(0),
-          childR: new Int32Array(0)
-        };
+function buildOctree(p, s, r, minLeaf, cubic) {
+  const N = p.length / 3;
+  if (N === 0) {
+    return {
+      data: new Float32Array(0),
+      leafFlags: new Uint8Array(0),
+      childL: new Int32Array(0),
+      childR: new Int32Array(0),
+      leafIndices: []             // return an empty leafIndices array for N=0
+    };
+  }
+
+  // one master indices buffer
+  const indices = new Uint32Array(N);
+  for (let i = 0; i < N; i++) indices[i] = i;
+
+  // compute root bounding box
+  let rootBox = computeAABB(p, s, r, indices, N);
+  if (cubic) {
+    const sizeX = rootBox[3] - rootBox[0];
+    const sizeY = rootBox[4] - rootBox[1];
+    const sizeZ = rootBox[5] - rootBox[2];
+    const size = Math.max(sizeX, sizeY, sizeZ);
+    const cx = 0.5 * (rootBox[0] + rootBox[3]);
+    const cy = 0.5 * (rootBox[1] + rootBox[4]);
+    const cz = 0.5 * (rootBox[2] + rootBox[5]);
+    rootBox = [
+      cx - 0.5 * size, cy - 0.5 * size, cz - 0.5 * size,
+      cx + 0.5 * size, cy + 0.5 * size, cz + 0.5 * size
+    ];
+  }
+
+  function OTJob(start, len, box) {
+    this.start = start;
+    this.len = len;
+    this.box = box;  // [minX, minY, minZ, maxX, maxY, maxZ]
+  }
+
+  const stack = [];
+  const outBoxes = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
+  const leafFlagsArr = [];  // parallel array of 1/0
+  const leafIndices = [];   // ← NEW: collect each leaf’s point‐indices
+
+  stack.push(new OTJob(0, N, rootBox));
+  const counts = new Uint32Array(8);
+
+  // iterative loop
+  while (stack.length > 0) {
+    const job = stack.pop();
+    const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
+    const cx = 0.5 * (minX + maxX);
+    const cy = 0.5 * (minY + maxY);
+    const cz = 0.5 * (minZ + maxZ);
+    const hx = 0.5 * (maxX - minX);
+    const hy = 0.5 * (maxY - minY);
+    const hz = 0.5 * (maxZ - minZ);
+
+    let isLeaf = true;
+    if (job.len > minLeaf) {
+      counts.fill(0);
+      // count points per octant
+      for (let i = 0; i < job.len; i++) {
+        const vi = indices[job.start + i] * 3;
+        let oct = 0;
+        if (p[vi]     > cx) oct |= 1;
+        if (p[vi + 1] > cy) oct |= 2;
+        if (p[vi + 2] > cz) oct |= 4;
+        counts[oct]++;
       }
-  
-      // one master indices buffer
-      const indices = new Uint32Array(N);
-      for (let i = 0; i < N; i++) indices[i] = i;
-  
-      // compute root bounding box
-      let rootBox = computeAABB(p, s, r, indices, N);
-      if (cubic) {
-        const sizeX = rootBox[3] - rootBox[0];
-        const sizeY = rootBox[4] - rootBox[1];
-        const sizeZ = rootBox[5] - rootBox[2];
-        const size = Math.max(sizeX, sizeY, sizeZ);
-        const cx = 0.5 * (rootBox[0] + rootBox[3]);
-        const cy = 0.5 * (rootBox[1] + rootBox[4]);
-        const cz = 0.5 * (rootBox[2] + rootBox[5]);
-        rootBox = [
-          cx - 0.5 * size, cy - 0.5 * size, cz - 0.5 * size,
-          cx + 0.5 * size, cy + 0.5 * size, cz + 0.5 * size
-        ];
+      let nonEmpty = 0;
+      for (let o = 0; o < 8; o++) {
+        if (counts[o] > 0) nonEmpty++;
       }
-  
-      function OTJob(start, len, box) {
-        this.start = start;
-        this.len = len;
-        this.box = box;  // [minX, minY, minZ, maxX, maxY, maxZ]
-      }
-  
-      const stack = [];
-      const outBoxes = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
-      const leafFlagsArr = [];  // parallel array of 1/0
-  
-      stack.push(new OTJob(0, N, rootBox));
-  
-      const counts = new Uint32Array(8);
-  
-      // iterative loop
-      while (stack.length > 0) {
-        const job = stack.pop();
-        const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
-        const cx = 0.5 * (minX + maxX);
-        const cy = 0.5 * (minY + maxY);
-        const cz = 0.5 * (minZ + maxZ);
-        const hx = 0.5 * (maxX - minX);
-        const hy = 0.5 * (maxY - minY);
-        const hz = 0.5 * (maxZ - minZ);
-  
-        let isLeaf = true;
-        if (job.len > minLeaf) {
-          counts.fill(0);
-          // count points per octant
-          for (let i = 0; i < job.len; i++) {
-            const vi = indices[job.start + i] * 3;
-            let oct = 0;
-            if (p[vi]     > cx) oct |= 1;
-            if (p[vi + 1] > cy) oct |= 2;
-            if (p[vi + 2] > cz) oct |= 4;
-            counts[oct]++;
-          }
-          let nonEmpty = 0;
-          for (let o = 0; o < 8; o++) {
-            if (counts[o] > 0) nonEmpty++;
-          }
-          if (nonEmpty > 1) {
-            isLeaf = false;
-            // prefix sums for offsets
-            const offs = new Uint32Array(8);
-            for (let o = 1; o < 8; o++) {
-              offs[o] = offs[o - 1] + counts[o - 1];
-            }
-            const tmp = counts.slice(); // copy
-            const packed = new Uint32Array(job.len);
-            // pack into temp buffer
-            for (let i = 0; i < job.len; i++) {
-              const vi = indices[job.start + i] * 3;
-              let oct = 0;
-              if (p[vi]     > cx) oct |= 1;
-              if (p[vi + 1] > cy) oct |= 2;
-              if (p[vi + 2] > cz) oct |= 4;
-              const pos = offs[oct] + (tmp[oct] - 1);
-              packed[pos] = indices[job.start + i];
-              tmp[oct]--;
-            }
-            // overwrite the region in indices
-            for (let i = 0; i < job.len; i++) {
-              indices[job.start + i] = packed[i];
-            }
-  
-            // spawn child jobs for each nonempty octant
-            for (let o = 0; o < 8; o++) {
-              const cnt = counts[o];
-              if (cnt === 0) continue;
-              let childBox;
-              if (cubic) {
-                const minCx = minX + ((o & 1) ? hx : 0);
-                const minCy = minY + ((o & 2) ? hy : 0);
-                const minCz = minZ + ((o & 4) ? hz : 0);
-                const maxCx = minX + ((o & 1) ? hx * 2 : hx);
-                const maxCy = minY + ((o & 2) ? hy * 2 : hy);
-                const maxCz = minZ + ((o & 4) ? hz * 2 : hz);
-                childBox = [minCx, minCy, minCz, maxCx, maxCy, maxCz];
-              } else {
-                const childStart = job.start + offs[o];
-                const subIdx = indices.subarray(childStart, childStart + cnt);
-                childBox = computeAABB(p, s, r, subIdx, cnt);
-              }
-              stack.push(new OTJob(job.start + offs[o], cnt, childBox));
-            }
-          }
+      if (nonEmpty > 1) {
+        isLeaf = false;
+        // prefix sums for offsets
+        const offs = new Uint32Array(8);
+        for (let o = 1; o < 8; o++) {
+          offs[o] = offs[o - 1] + counts[o - 1];
         }
-  
-        outBoxes.push(cx, cy, cz, hx, hy, hz);
-        leafFlagsArr.push(isLeaf ? 1 : 0);
+        const tmp = counts.slice();
+        const packed = new Uint32Array(job.len);
+        // pack into temp buffer
+        for (let i = 0; i < job.len; i++) {
+          const vi = indices[job.start + i] * 3;
+          let oct = 0;
+          if (p[vi]     > cx) oct |= 1;
+          if (p[vi + 1] > cy) oct |= 2;
+          if (p[vi + 2] > cz) oct |= 4;
+          const pos = offs[oct] + (tmp[oct] - 1);
+          packed[pos] = indices[job.start + i];
+          tmp[oct]--;
+        }
+        // overwrite the region in indices
+        for (let i = 0; i < job.len; i++) {
+          indices[job.start + i] = packed[i];
+        }
+
+        // spawn child jobs for each nonempty octant
+        for (let o = 0; o < 8; o++) {
+          const cnt = counts[o];
+          if (cnt === 0) continue;
+          let childBox;
+          if (cubic) {
+            const minCx = minX + ((o & 1) ? hx : 0);
+            const minCy = minY + ((o & 2) ? hy : 0);
+            const minCz = minZ + ((o & 4) ? hz : 0);
+            const maxCx = minX + ((o & 1) ? hx * 2 : hx);
+            const maxCy = minY + ((o & 2) ? hy * 2 : hy);
+            const maxCz = minZ + ((o & 4) ? hz * 2 : hz);
+            childBox = [minCx, minCy, minCz, maxCx, maxCy, maxCz];
+          } else {
+            const childStart = job.start + offs[o];
+            const subIdx = indices.subarray(childStart, childStart + cnt);
+            childBox = computeAABB(p, s, r, subIdx, cnt);
+          }
+          stack.push(new OTJob(job.start + offs[o], cnt, childBox));
+        }
       }
-  
-      // flatten results into typed arrays
-      const Nnodes = outBoxes.length / 6;
-      const data = new Float32Array(Nnodes * 6);
-      for (let i = 0; i < Nnodes * 6; i++) {
-        data[i] = outBoxes[i];
-      }
-      const leafFlags = new Uint8Array(Nnodes);
-      for (let i = 0; i < Nnodes; i++) {
-        leafFlags[i] = leafFlagsArr[i];
-      }
-      const childL = new Int32Array(Nnodes);
-      const childR = new Int32Array(Nnodes);
-      for (let i = 0; i < Nnodes; i++) {
-        childL[i] = -1;
-        childR[i] = -1;
-      }
-  
-      return { data, leafFlags, childL, childR };
     }
+
+    outBoxes.push(cx, cy, cz, hx, hy, hz);
+    leafFlagsArr.push(isLeaf ? 1 : 0);
+
+    if (isLeaf) {
+      // ← ADDED: capture exactly which point‐indices landed in this leaf
+      const subIdx = indices.subarray(job.start, job.start + job.len);
+      leafIndices.push(new Uint32Array(subIdx));
+    }
+  }
+
+  // flatten results into typed arrays
+  const Nnodes = outBoxes.length / 6;
+  const data = new Float32Array(Nnodes * 6);
+  for (let i = 0; i < Nnodes * 6; i++) {
+    data[i] = outBoxes[i];
+  }
+  const leafFlags = new Uint8Array(Nnodes);
+  for (let i = 0; i < Nnodes; i++) {
+    leafFlags[i] = leafFlagsArr[i];
+  }
+  const childL = new Int32Array(Nnodes);
+  const childR = new Int32Array(Nnodes);
+  for (let i = 0; i < Nnodes; i++) {
+    childL[i] = -1;
+    childR[i] = -1;
+  }
+
+  return {
+    data,
+    leafFlags,
+    childL,
+    childR,
+    leafIndices    // ← RETURN the collected leaf index‐lists
+  };
+}
+
   
     /** Worker message handler */
     self.onmessage = function(e) {
@@ -450,25 +464,28 @@
         const leafArr = result.leafFlags;
         const childL = result.childL;
         const childR = result.childR;
-  
+        const leafIdxs = result.leafIndices;  // ← new
+      
         self.postMessage(
           {
             version,
             buildTime: performance.now() - startTime,
-            data,        // Float32Array(6 * Nnodes)
-            leaf: leafArr,// Uint8Array(Nnodes)
-            childL,      // Int32Array(Nnodes)
-            childR,      // Int32Array(Nnodes)
-            leafIdxs: [] // no leafIndices returned for this octree
+            data,             // Float32Array(6 * Nnodes)
+            leaf: leafArr,    // Uint8Array(Nnodes)
+            childL,           // Int32Array(Nnodes)
+            childR,           // Int32Array(Nnodes)
+            leafIdxs          // Array<Uint32Array> for octree
           },
           [
             data.buffer,
             leafArr.buffer,
             childL.buffer,
-            childR.buffer
+            childR.buffer,
+            ...leafIdxs.map(arr => arr.buffer)  // transfer each leafIndices’ buffer
           ]
         );
       }
+      
     };
   </script>
 
