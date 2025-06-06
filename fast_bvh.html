@@ -89,315 +89,389 @@
 
   <!-- ────────────── WORKER CODE (inline) ────────────── -->
   <script id="oct-worker" type="javascript/worker">
+    // Highly-optimized BVH/Octree builder as a standalone Web Worker
+  
     const EPS = Number.EPSILON;
-
-    /* -------- AABB -------- */
-    function aabb(p, s, r, idx, len) {
+  
+    /** Compute AABB over a subset of points */
+    function computeAABB(p, s, r, idx, len) {
       let xmin =  1e9, ymin =  1e9, zmin =  1e9;
       let xmax = -1e9, ymax = -1e9, zmax = -1e9;
       for (let i = 0; i < len; i++) {
-        const id = idx[i] * 3;
-        const x = p[id],      y = p[id + 1],  z = p[id + 2];
-        const sx = s[id],     sy = s[id + 1], sz = s[id + 2];
+        const vi = idx[i] * 3;
+        const x = p[vi], y = p[vi + 1], z = p[vi + 2];
+        const sx = s[vi], sy = s[vi + 1], sz = s[vi + 2];
         const rad = r[idx[i]] || EPS;
-        const minxx = x - rad * sx, maxxx = x + rad * sx;
-        const minyy = y - rad * sy, maxyy = y + rad * sy;
-        const minzz = z - rad * sz, maxzz = z + rad * sz;
-        if (minxx < xmin) xmin = minxx;
-        if (maxxx > xmax) xmax = maxxx;
-        if (minyy < ymin) ymin = minyy;
-        if (maxyy > ymax) ymax = maxyy;
-        if (minzz < zmin) zmin = minzz;
-        if (maxzz > zmax) zmax = maxzz;
+        const minx = x - rad * sx, maxx = x + rad * sx;
+        const miny = y - rad * sy, maxy = y + rad * sy;
+        const minz = z - rad * sz, maxz = z + rad * sz;
+        if (minx < xmin) xmin = minx;
+        if (maxx > xmax) xmax = maxx;
+        if (miny < ymin) ymin = miny;
+        if (maxy > ymax) ymax = maxy;
+        if (minz < zmin) zmin = minz;
+        if (maxz > zmax) zmax = maxz;
       }
       return [xmin, ymin, zmin, xmax, ymax, zmax];
     }
-    function pushNode(out, cx, cy, cz, hx, hy, hz, isLeaf) {
-      out.push(cx, cy, cz, hx, hy, hz, isLeaf);
-    }
-
-    /* -------- Iterative BVH with Child‐Pointers -------- */
-    function buildBVH_withChildren(p, s, r, minLeaf, out, leafIdxs, childL, childR) {
-      let jobList = [];
-      const initialIdx = new Uint32Array(p.length / 3);
-      for (let i = 0; i < p.length / 3; i++) initialIdx[i] = i;
-      const stack = [{ idx: initialIdx, len: p.length / 3, parentIndex: -1, isLeftChild: false, leaf: 0 }];
-
-      while (stack.length) {
+  
+    /** Build a BVH over points (with child pointers) */
+    function buildBVH(p, s, r, minLeaf) {
+      const N = p.length / 3;
+      if (N === 0) {
+        return {
+          data: new Float32Array(0),
+          leafFlags: new Uint8Array(0),
+          childL: new Int32Array(0),
+          childR: new Int32Array(0),
+          leafIndices: []
+        };
+      }
+  
+      // 1) Create one master indices buffer
+      const indices = new Uint32Array(N);
+      for (let i = 0; i < N; i++) indices[i] = i;
+  
+      // Job structure for iterative splitting
+      function Job(start, len, parentIndex, isLeft) {
+        this.start = start;        // start offset into indices
+        this.len = len;            // number of points
+        this.parentIndex = parentIndex;  // index into jobList or -1
+        this.isLeft = isLeft;      // if this is left child of parent
+        this.leaf = false;         // set later
+        this.nodeIndex = -1;       // set after jobList is full
+      }
+  
+      const jobList = [];
+      const stack = [];
+      stack.push(new Job(0, N, -1, false));
+  
+      // 2) First pass: gather all jobs and partition indices in place
+      while (stack.length > 0) {
         const job = stack.pop();
         jobList.push(job);
-
-        const box = aabb(p, s, r, job.idx, job.len);
+  
+        const currStart = job.start;
+        const currLen = job.len;
+  
+        // Compute bounding box to choose split axis
+        const box = computeAABB(
+          p,
+          s,
+          r,
+          indices.subarray(currStart, currStart + currLen),
+          currLen
+        );
         const cx = 0.5 * (box[0] + box[3]);
         const cy = 0.5 * (box[1] + box[4]);
         const cz = 0.5 * (box[2] + box[5]);
         const hx = 0.5 * (box[3] - box[0]);
         const hy = 0.5 * (box[4] - box[1]);
         const hz = 0.5 * (box[5] - box[2]);
-
-        let leaf = 1;
-        if (job.len > minLeaf) {
-          const sizes = [hx * 2, hy * 2, hz * 2];
-          let axis = sizes[1] > sizes[0] ? 1 : 0;
-          axis = sizes[2] > sizes[axis] ? 2 : axis;
-          const L = [], R = [];
-          const mid = [cx, cy, cz][axis];
-          for (let i = 0; i < job.len; i++) {
-            const id = job.idx[i] * 3;
-            const v = p[id + axis];
-            (v <= mid ? L : R).push(job.idx[i]);
+  
+        let isLeaf = true;
+        if (currLen > minLeaf) {
+          // pick axis with largest span
+          let axis = hx * 2 >= hy * 2 ? 0 : 1;
+          if (hz * 2 > (axis === 0 ? hx * 2 : hy * 2)) {
+            axis = 2;
           }
-          if (L.length >= minLeaf && R.length >= minLeaf) {
-            leaf = 0;
-            stack.push({ idx: new Uint32Array(R), len: R.length, parentIndex: jobList.length - 1, isLeftChild: false, leaf: 0 });
-            stack.push({ idx: new Uint32Array(L), len: L.length, parentIndex: jobList.length - 1, isLeftChild: true, leaf: 0 });
+          const midVal = axis === 0 ? cx : axis === 1 ? cy : cz;
+  
+          // partition in place so that indices ≤ midVal come first
+          let leftWrite = currStart;
+          for (let i = currStart; i < currStart + currLen; i++) {
+            const v = p[indices[i] * 3 + axis];
+            if (v <= midVal) {
+              const tmp = indices[i];
+              indices[i] = indices[leftWrite];
+              indices[leftWrite] = tmp;
+              leftWrite++;
+            }
+          }
+          const leftCount = leftWrite - currStart;
+          const rightCount = currLen - leftCount;
+  
+          if (leftCount >= minLeaf && rightCount >= minLeaf) {
+            isLeaf = false;
+            // push right child first so left is processed last (stack LIFO)
+            stack.push(new Job(currStart + leftCount, rightCount, jobList.length - 1, false));
+            stack.push(new Job(currStart, leftCount, jobList.length - 1, true));
           }
         }
-        job.leaf = leaf;
+        job.leaf = isLeaf;
       }
-
+  
+      // 3) Assign nodeIndex to each job
       const Nnodes = jobList.length;
       for (let i = 0; i < Nnodes; i++) {
         jobList[i].nodeIndex = i;
       }
+  
+      // 4) Allocate output arrays
+      const data = new Float32Array(Nnodes * 6);    // [cx, cy, cz, hx, hy, hz]
+      const leafFlags = new Uint8Array(Nnodes);     // 1 if leaf
+      const childL = new Int32Array(Nnodes);        // left child idx
+      const childR = new Int32Array(Nnodes);        // right child idx
+      const leafIndices = [];
+  
       for (let i = 0; i < Nnodes; i++) {
         childL[i] = -1;
         childR[i] = -1;
       }
-
+  
+      // 5) Second pass: fill in node bounds, flags, children, leafIndices
       for (let i = 0; i < Nnodes; i++) {
         const job = jobList[i];
-        const idxArr = job.idx;
+        const start = job.start;
         const len = job.len;
-        const leafFlag = job.leaf;
-
-        const box = aabb(p, s, r, idxArr, len);
+        const subIdx = indices.subarray(start, start + len);
+  
+        const box = computeAABB(p, s, r, subIdx, len);
         const cx = 0.5 * (box[0] + box[3]);
         const cy = 0.5 * (box[1] + box[4]);
         const cz = 0.5 * (box[2] + box[5]);
         const hx = 0.5 * (box[3] - box[0]);
         const hy = 0.5 * (box[4] - box[1]);
         const hz = 0.5 * (box[5] - box[2]);
-
-        pushNode(out, cx, cy, cz, hx, hy, hz, leafFlag);
-        if (leafFlag) {
-          leafIdxs.push(new Uint32Array(idxArr));
+  
+        const offset = i * 6;
+        data[offset]     = cx;
+        data[offset + 1] = cy;
+        data[offset + 2] = cz;
+        data[offset + 3] = hx;
+        data[offset + 4] = hy;
+        data[offset + 5] = hz;
+  
+        leafFlags[i] = job.leaf ? 1 : 0;
+        if (job.leaf) {
+          // copy leaf indices into new Uint32Array
+          leafIndices.push(new Uint32Array(subIdx));
         }
-
+  
         if (job.parentIndex >= 0) {
-          const pIdx = jobList[job.parentIndex].nodeIndex;
-          if (job.isLeftChild) {
-            childL[pIdx] = job.nodeIndex;
+          const parentNodeIndex = jobList[job.parentIndex].nodeIndex;
+          if (job.isLeft) {
+            childL[parentNodeIndex] = job.nodeIndex;
           } else {
-            childR[pIdx] = job.nodeIndex;
+            childR[parentNodeIndex] = job.nodeIndex;
           }
         }
       }
+  
+      return { data, leafFlags, childL, childR, leafIndices };
     }
-
-    /* -------- Iterative Octree (no child pointers for now) -------- */
-    function buildOctree(p, s, r, minLeaf, cubic, stack, out) {
+  
+    /** Build a (pointer-free) Octree over points */
+    function buildOctree(p, s, r, minLeaf, cubic) {
       const N = p.length / 3;
-      const root = new Uint32Array(N);
-      for (let i = 0; i < N; i++) root[i] = i;
-
-      let rootBox = aabb(p, s, r, root, N);
+      if (N === 0) {
+        return {
+          data: new Float32Array(0),
+          leafFlags: new Uint8Array(0),
+          childL: new Int32Array(0),
+          childR: new Int32Array(0)
+        };
+      }
+  
+      // one master indices buffer
+      const indices = new Uint32Array(N);
+      for (let i = 0; i < N; i++) indices[i] = i;
+  
+      // compute root bounding box
+      let rootBox = computeAABB(p, s, r, indices, N);
       if (cubic) {
-        const size = Math.max(
-          rootBox[3] - rootBox[0],
-          rootBox[4] - rootBox[1],
-          rootBox[5] - rootBox[2]
-        );
-        const cx = (rootBox[0] + rootBox[3]) * 0.5;
-        const cy = (rootBox[1] + rootBox[4]) * 0.5;
-        const cz = (rootBox[2] + rootBox[5]) * 0.5;
+        const sizeX = rootBox[3] - rootBox[0];
+        const sizeY = rootBox[4] - rootBox[1];
+        const sizeZ = rootBox[5] - rootBox[2];
+        const size = Math.max(sizeX, sizeY, sizeZ);
+        const cx = 0.5 * (rootBox[0] + rootBox[3]);
+        const cy = 0.5 * (rootBox[1] + rootBox[4]);
+        const cz = 0.5 * (rootBox[2] + rootBox[5]);
         rootBox = [
-          cx - size * 0.5, cy - size * 0.5, cz - size * 0.5,
-          cx + size * 0.5, cy + size * 0.5, cz + size * 0.5
+          cx - 0.5 * size, cy - 0.5 * size, cz - 0.5 * size,
+          cx + 0.5 * size, cy + 0.5 * size, cz + 0.5 * size
         ];
       }
-
-      stack.length = 0;
-      stack.push({ idx: root, len: N, box: rootBox });
-      const counts = new Uint16Array(8);
-
-      while (stack.length) {
+  
+      function OTJob(start, len, box) {
+        this.start = start;
+        this.len = len;
+        this.box = box;  // [minX, minY, minZ, maxX, maxY, maxZ]
+      }
+  
+      const stack = [];
+      const outBoxes = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
+      const leafFlagsArr = [];  // parallel array of 1/0
+  
+      stack.push(new OTJob(0, N, rootBox));
+  
+      const counts = new Uint32Array(8);
+  
+      // iterative loop
+      while (stack.length > 0) {
         const job = stack.pop();
         const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
-        const cx = (minX + maxX) * 0.5;
-        const cy = (minY + maxY) * 0.5;
-        const cz = (minZ + maxZ) * 0.5;
-        const hx = (maxX - minX) * 0.5;
-        const hy = (maxY - minY) * 0.5;
-        const hz = (maxZ - minZ) * 0.5;
-
-        let leaf = 1;
+        const cx = 0.5 * (minX + maxX);
+        const cy = 0.5 * (minY + maxY);
+        const cz = 0.5 * (minZ + maxZ);
+        const hx = 0.5 * (maxX - minX);
+        const hy = 0.5 * (maxY - minY);
+        const hz = 0.5 * (maxZ - minZ);
+  
+        let isLeaf = true;
         if (job.len > minLeaf) {
           counts.fill(0);
+          // count points per octant
           for (let i = 0; i < job.len; i++) {
-            const id = job.idx[i] * 3;
-            let o = 0;
-            if (p[id]      > cx) o |= 1;
-            if (p[id + 1]  > cy) o |= 2;
-            if (p[id + 2]  > cz) o |= 4;
-            counts[o]++;
+            const vi = indices[job.start + i] * 3;
+            let oct = 0;
+            if (p[vi]     > cx) oct |= 1;
+            if (p[vi + 1] > cy) oct |= 2;
+            if (p[vi + 2] > cz) oct |= 4;
+            counts[oct]++;
           }
-
           let nonEmpty = 0;
-          for (const c of counts) if (c) nonEmpty++;
-
+          for (let o = 0; o < 8; o++) {
+            if (counts[o] > 0) nonEmpty++;
+          }
           if (nonEmpty > 1) {
-            leaf = 0;
+            isLeaf = false;
+            // prefix sums for offsets
             const offs = new Uint32Array(8);
-            for (let i = 1; i < 8; i++) offs[i] = offs[i - 1] + counts[i - 1];
-
-            const packed = new Uint32Array(job.len);
-            const tmp = counts.slice();
-            for (let i = 0; i < job.len; i++) {
-              const id = job.idx[i] * 3;
-              let o = 0;
-              if (p[id]      > cx) o |= 1;
-              if (p[id + 1]  > cy) o |= 2;
-              if (p[id + 2]  > cz) o |= 4;
-              packed[offs[o] + (--tmp[o])] = job.idx[i];
+            for (let o = 1; o < 8; o++) {
+              offs[o] = offs[o - 1] + counts[o - 1];
             }
-
+            const tmp = counts.slice(); // copy
+            const packed = new Uint32Array(job.len);
+            // pack into temp buffer
+            for (let i = 0; i < job.len; i++) {
+              const vi = indices[job.start + i] * 3;
+              let oct = 0;
+              if (p[vi]     > cx) oct |= 1;
+              if (p[vi + 1] > cy) oct |= 2;
+              if (p[vi + 2] > cz) oct |= 4;
+              const pos = offs[oct] + (tmp[oct] - 1);
+              packed[pos] = indices[job.start + i];
+              tmp[oct]--;
+            }
+            // overwrite the region in indices
+            for (let i = 0; i < job.len; i++) {
+              indices[job.start + i] = packed[i];
+            }
+  
+            // spawn child jobs for each nonempty octant
             for (let o = 0; o < 8; o++) {
               const cnt = counts[o];
               if (cnt === 0) continue;
-              const sub = new Uint32Array(packed.buffer, offs[o] * 4, cnt);
-
-              let bb;
+              let childBox;
               if (cubic) {
-                bb = [
-                  minX + (o & 1 ? hx : 0),
-                  minY + (o & 2 ? hy : 0),
-                  minZ + (o & 4 ? hz : 0),
-                  minX + (o & 1 ? hx * 2 : hx),
-                  minY + (o & 2 ? hy * 2 : hy),
-                  minZ + (o & 4 ? hz * 2 : hz)
-                ];
+                const minCx = minX + ((o & 1) ? hx : 0);
+                const minCy = minY + ((o & 2) ? hy : 0);
+                const minCz = minZ + ((o & 4) ? hz : 0);
+                const maxCx = minX + ((o & 1) ? hx * 2 : hx);
+                const maxCy = minY + ((o & 2) ? hy * 2 : hy);
+                const maxCz = minZ + ((o & 4) ? hz * 2 : hz);
+                childBox = [minCx, minCy, minCz, maxCx, maxCy, maxCz];
               } else {
-                bb = aabb(p, s, r, sub, cnt);
+                const childStart = job.start + offs[o];
+                const subIdx = indices.subarray(childStart, childStart + cnt);
+                childBox = computeAABB(p, s, r, subIdx, cnt);
               }
-
-              stack.push({ idx: sub, len: cnt, box: bb });
+              stack.push(new OTJob(job.start + offs[o], cnt, childBox));
             }
           }
         }
-
-        pushNode(out, cx, cy, cz, hx, hy, hz, leaf);
+  
+        outBoxes.push(cx, cy, cz, hx, hy, hz);
+        leafFlagsArr.push(isLeaf ? 1 : 0);
       }
+  
+      // flatten results into typed arrays
+      const Nnodes = outBoxes.length / 6;
+      const data = new Float32Array(Nnodes * 6);
+      for (let i = 0; i < Nnodes * 6; i++) {
+        data[i] = outBoxes[i];
+      }
+      const leafFlags = new Uint8Array(Nnodes);
+      for (let i = 0; i < Nnodes; i++) {
+        leafFlags[i] = leafFlagsArr[i];
+      }
+      const childL = new Int32Array(Nnodes);
+      const childR = new Int32Array(Nnodes);
+      for (let i = 0; i < Nnodes; i++) {
+        childL[i] = -1;
+        childR[i] = -1;
+      }
+  
+      return { data, leafFlags, childL, childR };
     }
-
-    /* -------- Worker API -------- */
-    self.onmessage = e => {
-      const { version, structure, minLeaf, pos, scl, rad, cubic } = e.data;
-      const raw = [];
-      const leafIdxs = [];
-
+  
+    /** Worker message handler */
+    self.onmessage = function(e) {
+      const { version, structure, minLeaf, pos, scl, rad, cubic, t0 } = e.data;
+      
+  const startTime = performance.now();
+      
       if (structure === "bvh") {
-        // Estimate node count by building a temporary job list
-        let jobList = [];
-        const initIdx = new Uint32Array(pos.length / 3);
-        for (let i = 0; i < pos.length / 3; i++) initIdx[i] = i;
-        const stackTemp = [{ idx: initIdx, len: pos.length / 3, parentIndex: -1, isLeftChild: false, leaf: 0 }];
-        while (stackTemp.length) {
-          const job = stackTemp.pop();
-          jobList.push(job);
-          const box = aabb(pos, scl, rad, job.idx, job.len);
-          const cx = 0.5 * (box[0] + box[3]);
-          const cy = 0.5 * (box[1] + box[4]);
-          const cz = 0.5 * (box[2] + box[5]);
-          const hx = 0.5 * (box[3] - box[0]);
-          const hy = 0.5 * (box[4] - box[1]);
-          const hz = 0.5 * (box[5] - box[2]);
-
-          let leaf = 1;
-          if (job.len > minLeaf) {
-            const sizes = [hx * 2, hy * 2, hz * 2];
-            let axis = sizes[1] > sizes[0] ? 1 : 0;
-            axis = sizes[2] > sizes[axis] ? 2 : axis;
-            const L = [], R = [];
-            const mid = [cx, cy, cz][axis];
-            for (let i = 0; i < job.len; i++) {
-              const id = job.idx[i] * 3;
-              const v = pos[id + axis];
-              (v <= mid ? L : R).push(job.idx[i]);
-            }
-            if (L.length >= minLeaf && R.length >= minLeaf) {
-              leaf = 0;
-              stackTemp.push({ idx: new Uint32Array(R), len: R.length, parentIndex: jobList.length - 1, isLeftChild: false, leaf: 0 });
-              stackTemp.push({ idx: new Uint32Array(L), len: L.length, parentIndex: jobList.length - 1, isLeftChild: true, leaf: 0 });
-            }
-          }
-          job.leaf = leaf;
-        }
-        const Nnodes = jobList.length;
-        const childL = new Int32Array(Nnodes);
-        const childR = new Int32Array(Nnodes);
-
-        buildBVH_withChildren(pos, scl, rad, minLeaf, raw, leafIdxs, childL, childR);
-
-        const data = new Float32Array(Nnodes * 6);
-        const leafArr = new Uint8Array(Nnodes);
-        for (let i = 0; i < Nnodes; i++) {
-          const o = i * 7, d = i * 6;
-          data[d]     = raw[o];
-          data[d + 1] = raw[o + 1];
-          data[d + 2] = raw[o + 2];
-          data[d + 3] = raw[o + 3];
-          data[d + 4] = raw[o + 4];
-          data[d + 5] = raw[o + 5];
-          leafArr[i]  = raw[o + 6];
-        }
-
+        // Build BVH
+        const result = buildBVH(pos, scl, rad, minLeaf);
+        const Nnodes = result.data.length / 6;
+        const data = result.data;
+        const leafArr = result.leafFlags;
+        const childL = result.childL;
+        const childR = result.childR;
+        const leafIdxs = result.leafIndices;
+  
+        // Prepare postMessage with transferable buffers
         self.postMessage(
           {
             version,
-            buildTime: performance.now() - e.data.t0,
-            data,        // Float32Array(6*Nnodes)
+            buildTime: performance.now() - startTime,
+            data,        // Float32Array(6 * Nnodes)
             leaf: leafArr,// Uint8Array(Nnodes)
             childL,      // Int32Array(Nnodes)
             childR,      // Int32Array(Nnodes)
             leafIdxs     // Array<Uint32Array>
           },
-          [data.buffer, leafArr.buffer, childL.buffer, childR.buffer, ...leafIdxs.map(a => a.buffer)]
+          [
+            data.buffer,
+            leafArr.buffer,
+            childL.buffer,
+            childR.buffer,
+            ...leafIdxs.map(arr => arr.buffer)
+          ]
         );
       } else {
-        // Build octree without child pointers
-        const stack = [], outArr = [], leafIdxsLocal = [];
-        buildOctree(pos, scl, rad, minLeaf, cubic, stack, outArr);
-        const Nnodes = outArr.length / 7;
-        const data = new Float32Array(Nnodes * 6);
-        const leafArr = new Uint8Array(Nnodes);
-        for (let i = 0; i < Nnodes; i++) {
-          const o = i * 7, d = i * 6;
-          data[d]     = outArr[o];
-          data[d + 1] = outArr[o + 1];
-          data[d + 2] = outArr[o + 2];
-          data[d + 3] = outArr[o + 3];
-          data[d + 4] = outArr[o + 4];
-          data[d + 5] = outArr[o + 5];
-          leafArr[i]  = outArr[o + 6];
-        }
-        const childL = new Int32Array(Nnodes).fill(-1);
-        const childR = new Int32Array(Nnodes).fill(-1);
+        // Build Octree
+        const result = buildOctree(pos, scl, rad, minLeaf, cubic);
+        const Nnodes = result.data.length / 6;
+        const data = result.data;
+        const leafArr = result.leafFlags;
+        const childL = result.childL;
+        const childR = result.childR;
+  
         self.postMessage(
           {
             version,
-            buildTime: performance.now() - e.data.t0,
-            data,
-            leaf: leafArr,
-            childL,
-            childR,
-            leafIdxs: leafIdxsLocal
+            buildTime: performance.now() - startTime,
+            data,        // Float32Array(6 * Nnodes)
+            leaf: leafArr,// Uint8Array(Nnodes)
+            childL,      // Int32Array(Nnodes)
+            childR,      // Int32Array(Nnodes)
+            leafIdxs: [] // no leafIndices returned for this octree
           },
-          [data.buffer, leafArr.buffer, childL.buffer, childR.buffer]
+          [
+            data.buffer,
+            leafArr.buffer,
+            childL.buffer,
+            childR.buffer
+          ]
         );
       }
     };
   </script>
+
   <!-- ────────────── /worker ────────────── -->
 
   <script src="https://cdn.jsdelivr.net/npm/babylonjs@6.39.0/babylon.js"></script>
