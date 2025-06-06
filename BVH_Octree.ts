@@ -34,6 +34,8 @@ export interface OctreeResult {
   childL: Int32Array;
   /** Int32Array of length Nnodes: always all -1 (no child pointers) */
   childR: Int32Array;
+  /** Array of Uint32Array, one per leaf, listing the point‐indices in that leaf */
+  leafIndices: Uint32Array[];
 }
 
 /**
@@ -157,17 +159,9 @@ export function buildBVH(
 
       // partition in place: all points ≤ midVal on left, > midVal on right
       let leftWrite = currIdx;
-      let rightWrite = currIdx + currLen - 1;
-
-      // Two‐pointer partition—BUT ensure stability of comparison: ≤ mid goes left
-      // For simplicity, do a single scan with swap technique (in‐place stableish partition)
-      // We'll do single‐pass: move items ≤ mid to front via leftWrite++.
-      // At end, left chunk = [currIdx .. leftWrite-1], right chunk = [leftWrite .. currIdx+currLen-1].
-      leftWrite = currIdx;
       for (let i = currIdx; i < currIdx + currLen; i++) {
         const v = p[indices[i] * 3 + axis];
         if (v <= midVal) {
-          // swap indices[i] with indices[leftWrite]
           const tmp = indices[i];
           indices[i] = indices[leftWrite];
           indices[leftWrite] = tmp;
@@ -285,7 +279,7 @@ export function buildBVH(
  * @param r       Float32Array of length Npoints
  * @param minLeaf minimum number of points per leaf
  * @param cubic   if true, root box is expanded to a cube
- * @returns       OctreeResult with node bounds, leaf flags, and (no) child pointers
+ * @returns       OctreeResult with node bounds, leaf flags, child pointers, and leaf‐index lists
  */
 export function buildOctree(
   p: Float32Array,
@@ -300,7 +294,8 @@ export function buildOctree(
       data: new Float32Array(0),
       leafFlags: new Uint8Array(0),
       childL: new Int32Array(0),
-      childR: new Int32Array(0)
+      childR: new Int32Array(0),
+      leafIndices: []
     };
   }
 
@@ -334,15 +329,14 @@ export function buildOctree(
   }
 
   const stack: OTJob[] = [];
-  const outBoxes: number[] = [];      // dynamic array: each node pushed as [cx,cy,cz,hx,hy,hz,leaf]
-  const leafFlagsArr: number[] = [];  // 1 if leaf, 0 else
+  const outBoxes: number[] = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
+  const leafFlagsArr: number[] = [];  // parallel array of 1/0
+  const leafIndices: Uint32Array[] = [];
 
-  // push root job
   stack.push({ start: 0, len: N, box: rootBox });
-
-  // Reusable working arrays
   const counts = new Uint32Array(8);
 
+  // iterative loop
   while (stack.length > 0) {
     const job = stack.pop() as OTJob;
     const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
@@ -357,7 +351,6 @@ export function buildOctree(
     let isLeaf = true;
 
     if (job.len > minLeaf) {
-      // zero counts
       counts.fill(0);
       // count how many points go to each octant
       for (let i = 0; i < job.len; i++) {
@@ -368,10 +361,9 @@ export function buildOctree(
         if (p[idx + 2] > cz) oct |= 4;
         counts[oct]++;
       }
-      // count how many nonempty children
       let nonEmpty = 0;
-      for (let oct = 0; oct < 8; oct++) {
-        if (counts[oct] > 0) nonEmpty++;
+      for (let o = 0; o < 8; o++) {
+        if (counts[o] > 0) nonEmpty++;
       }
 
       if (nonEmpty > 1) {
@@ -379,10 +371,9 @@ export function buildOctree(
         isLeaf = false;
         // compute offsets
         const offs = new Uint32Array(8);
-        for (let oct = 1; oct < 8; oct++) {
-          offs[oct] = offs[oct - 1] + counts[oct - 1];
+        for (let o = 1; o < 8; o++) {
+          offs[o] = offs[o - 1] + counts[o - 1];
         }
-        // copy counts for tracking insertion
         const tmp = new Uint32Array(counts);
 
         // pack into an intermediate array
@@ -393,52 +384,48 @@ export function buildOctree(
           if (p[idx] > cx) oct |= 1;
           if (p[idx + 1] > cy) oct |= 2;
           if (p[idx + 2] > cz) oct |= 4;
-          const pos = offs[oct] + (tmp[oct] - 1);
-          packed[pos] = indices[job.start + i];
+          packed[offs[oct] + (tmp[oct] - 1)] = indices[job.start + i];
           tmp[oct]--;
         }
-        // overwrite region in `indices` so children see contiguous subarrays
+        // overwrite the region in indices
         for (let i = 0; i < job.len; i++) {
           indices[job.start + i] = packed[i];
         }
 
         // spawn child jobs for each nonempty octant
-        for (let oct = 0; oct < 8; oct++) {
-          const cnt = counts[oct];
+        for (let o = 0; o < 8; o++) {
+          const cnt = counts[o];
           if (cnt === 0) continue;
-          const offsetInRegion = offs[oct];
-          // compute child BBox
           let childBox: [number, number, number, number, number, number];
           if (cubic) {
-            // subdivide uniformly
-            const minCx = minX + ((oct & 1) ? hx : 0);
-            const minCy = minY + ((oct & 2) ? hy : 0);
-            const minCz = minZ + ((oct & 4) ? hz : 0);
-            const maxCx = minX + ((oct & 1) ? hx * 2 : hx);
-            const maxCy = minY + ((oct & 2) ? hy * 2 : hy);
-            const maxCz = minZ + ((oct & 4) ? hz * 2 : hz);
+            const minCx = minX + ((o & 1) ? hx : 0);
+            const minCy = minY + ((o & 2) ? hy : 0);
+            const minCz = minZ + ((o & 4) ? hz : 0);
+            const maxCx = minX + ((o & 1) ? hx * 2 : hx);
+            const maxCy = minY + ((o & 2) ? hy * 2 : hy);
+            const maxCz = minZ + ((o & 4) ? hz * 2 : hz);
             childBox = [minCx, minCy, minCz, maxCx, maxCy, maxCz];
           } else {
-            const childIdxStart = job.start + offsetInRegion;
-            const subIdx = indices.subarray(childIdxStart, childIdxStart + cnt);
+            const childStart = job.start + offs[o];
+            const subIdx = indices.subarray(childStart, childStart + cnt);
             childBox = computeAABB(p, s, r, subIdx, cnt);
           }
-          // push child job
-          stack.push({
-            start: job.start + offsetInRegion,
-            len: cnt,
-            box: childBox
-          });
+          stack.push({ start: job.start + offs[o], len: cnt, box: childBox });
         }
       }
     }
 
-    // record this node
     outBoxes.push(cx, cy, cz, hx, hy, hz);
     leafFlagsArr.push(isLeaf ? 1 : 0);
+
+    if (isLeaf) {
+      // copy leaf indices into a fresh Uint32Array
+      const subIdx = indices.subarray(job.start, job.start + job.len);
+      leafIndices.push(new Uint32Array(subIdx));
+    }
   }
 
-  // convert to typed arrays
+  // flatten results into typed arrays
   const Nnodes = outBoxes.length / 6;
   const data = new Float32Array(Nnodes * 6);
   for (let i = 0; i < Nnodes * 6; i++) {
@@ -456,7 +443,13 @@ export function buildOctree(
     childR[i] = -1;
   }
 
-  return { data, leafFlags, childL, childR };
+  return {
+    data,
+    leafFlags,
+    childL,
+    childR,
+    leafIndices
+  };
 }
 
 
@@ -483,6 +476,6 @@ const octResult = buildOctree(pos, scl, rad, minLeaf, cubic);
 // octResult.data       → Float32Array([cx0, cy0, cz0, hx0, hy0, hz0,  cx1, …])
 // octResult.leafFlags  → Uint8Array([0, 1, 1, 0, …])
 // octResult.childL/R   → all −1 (no pointers)
-
+// octResult.leafIndices → Array<Uint32Array> with one entry per octree leaf
 
 */
