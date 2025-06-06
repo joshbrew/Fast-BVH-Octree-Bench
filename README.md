@@ -1,5 +1,5 @@
 # Fast-BVH-Octree-Bench
-Fast multithreaded BVH and Octree (dynamic forced cubes) generation in plain JS, ~10ms for 10,000 entities (groups of 6) with leaf indexing for traversal! Traversal in our test is on the order of microseconds.
+Fast multithreaded BVH and Octree (dynamic forced cubes) generation in plain JS, 5-10ms for 10,000 entities (groups of 6) with leaf indexing for traversal! Traversal in our test is on the order of microseconds.
 
 Improvements would come in the form of SharedArrayBuffers (requires hosted context) or fully offloading to a compute shader (tough as nuts! https://developer.nvidia.com/blog/thinking-parallel-part-iii-tree-construction-gpu/). Nvidia's 2012 benchmark here is 0.53ms for 12.5K objects, we are still off by 20X without GPU on a single 2020-era cpu thread. 
 
