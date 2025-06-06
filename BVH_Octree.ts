@@ -1,11 +1,15 @@
 /**
  * A small, highly‐optimized TypeScript BVH/Octree builder utility.
- * 
+ *
  * Provides:
- *  - buildBVH(...)  → constructs an axis‐aligned bounding‐box hierarchy (BVH)
- *  - buildOctree(...) → constructs a (non‐pointer) octree
- * 
- * Both return typed arrays for node bounds, leaf flags, child pointers, and leaf‐index lists.
+ *  - buildBVH(...)    → constructs an axis‐aligned bounding‐box hierarchy (BVH)
+ *  - buildOctree(...) → constructs a (pointer‐free) octree, returning explicit children‐lists
+ *
+ * In addition, we expose:
+ *  - findLeafBVH(...)         → descent BVH to find a leaf index for a query point
+ *  - collectHierarchyBVH(...) → return full root‐to‐leaf node‐index path in BVH
+ *  - findLeafOctree(...)         → descent Octree to find a leaf index for a query point
+ *  - collectHierarchyOctree(...) → return full root‐to‐leaf node‐index path in Octree
  */
 
 const EPS = Number.EPSILON;
@@ -30,12 +34,17 @@ export interface OctreeResult {
   data: Float32Array;
   /** Uint8Array of length Nnodes: 1 for leaf, 0 for internal */
   leafFlags: Uint8Array;
-  /** Int32Array of length Nnodes: always all -1 (no child pointers) */
+  /** Int32Array of length Nnodes: always all -1 (no binary child pointers) */
   childL: Int32Array;
-  /** Int32Array of length Nnodes: always all -1 (no child pointers) */
+  /** Int32Array of length Nnodes: always all -1 (no binary child pointers) */
   childR: Int32Array;
   /** Array of Uint32Array, one per leaf, listing the point‐indices in that leaf */
   leafIndices: Uint32Array[];
+  /**
+   * Array of Uint32Array, one per node, listing up to 8 child‐node indices.  
+   * If a node is a leaf, childrenIdxs[nodeIndex] is an empty Uint32Array.
+   */
+  childrenIdxs: Uint32Array[];
 }
 
 /**
@@ -54,7 +63,6 @@ function computeAABB(
   idx: Uint32Array,
   len: number
 ): [number, number, number, number, number, number] {
-  // initialize to very large/small
   let xmin = 1e9, ymin = 1e9, zmin = 1e9;
   let xmax = -1e9, ymax = -1e9, zmax = -1e9;
 
@@ -62,8 +70,8 @@ function computeAABB(
     const vi = idx[i] * 3;
     const x = p[vi], y = p[vi + 1], z = p[vi + 2];
     const sx = s[vi], sy = s[vi + 1], sz = s[vi + 2];
-    // if radius is zero or undefined, use EPS
     const rad = r[idx[i]] || EPS;
+
     const minx = x - rad * sx, maxx = x + rad * sx;
     const miny = y - rad * sy, maxy = y + rad * sy;
     const minz = z - rad * sz, maxz = z + rad * sz;
@@ -75,7 +83,6 @@ function computeAABB(
     if (minz < zmin) zmin = minz;
     if (maxz > zmax) zmax = maxz;
   }
-
   return [xmin, ymin, zmin, xmax, ymax, zmax];
 }
 
@@ -140,7 +147,6 @@ export function buildBVH(
       indices.subarray(currIdx, currIdx + currLen),
       currLen
     );
-    // compute center and half‐sizes (not saved now; recomputed later)
     const cx = 0.5 * (box[0] + box[3]);
     const cy = 0.5 * (box[1] + box[4]);
     const cz = 0.5 * (box[2] + box[5]);
@@ -268,18 +274,19 @@ export function buildBVH(
 
 
 /**
- * Build a (non‐pointer) Octree over points.
+ * Build a (non‐pointer) Octree over points, but also record up to 8 child pointers per node.
  *
- * Uses a simple iterative stack, no per‐node child pointers (all will remain -1).
- * Splits space into up to 8 octants as long as more than one octant contains points
- * and the node has > minLeaf points. If cubic=true, force the root bounding box to be a cube.
+ * Uses a two‐pass approach (identical in style to buildBVH):
+ *   - Pass 1: gather all jobs into jobList[], each with parentIndex
+ *   - Pass 2: assign nodeIndex, build childrenIdxs[], then flatten out box/leaf/leafIndices
  *
  * @param p       Float32Array of length 3*Npoints
  * @param s       Float32Array of length 3*Npoints
  * @param r       Float32Array of length Npoints
  * @param minLeaf minimum number of points per leaf
  * @param cubic   if true, root box is expanded to a cube
- * @returns       OctreeResult with node bounds, leaf flags, child pointers, and leaf‐index lists
+ * @returns       OctreeResult with node bounds, leaf flags, binary child pointers (all -1), 
+ *                plus leafIndices and childrenIdxs
  */
 export function buildOctree(
   p: Float32Array,
@@ -295,17 +302,18 @@ export function buildOctree(
       leafFlags: new Uint8Array(0),
       childL: new Int32Array(0),
       childR: new Int32Array(0),
-      leafIndices: []
+      leafIndices: [],
+      childrenIdxs: []
     };
   }
 
-  // initial full‐set indices
+  // 1) Initial indices: [0,1,2,…,N-1]
   const indices = new Uint32Array(N);
   for (let i = 0; i < N; i++) {
     indices[i] = i;
   }
 
-  // Compute root AABB
+  // Compute root bounding box
   let rootBox = computeAABB(p, s, r, indices, N);
   if (cubic) {
     const sizeX = rootBox[3] - rootBox[0];
@@ -321,24 +329,28 @@ export function buildOctree(
     ];
   }
 
-  /** Octree job, storing index‐subset and bounding box */
+  /** Octree job (for Pass 1) */
   interface OTJob {
-    start: number;        // start index into `indices`
-    len: number;          // number of points
+    start: number;  // start index into `indices`
+    len: number;    // number of points in this node
     box: [number, number, number, number, number, number]; // bounding box
+    parentIndex: number; // index in jobList[] of this job's parent, or -1 for root
+    nodeIndex?: number;  // assigned in Pass 2
+    leaf: boolean;       // assigned in Pass 1
   }
 
+  const jobList: OTJob[] = [];
   const stack: OTJob[] = [];
-  const outBoxes: number[] = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
-  const leafFlagsArr: number[] = [];  // parallel array of 1/0
-  const leafIndices: Uint32Array[] = [];
+  stack.push({ start: 0, len: N, box: rootBox, parentIndex: -1, leaf: false });
 
-  stack.push({ start: 0, len: N, box: rootBox });
+  // Temporary array to count octant populations
   const counts = new Uint32Array(8);
 
-  // iterative loop
+  // 2) Pass 1: gather all OTJob entries, partition in place, record parentIndex
   while (stack.length > 0) {
     const job = stack.pop() as OTJob;
+    jobList.push(job);
+
     const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
     const cx = 0.5 * (minX + maxX);
     const cy = 0.5 * (minY + maxY);
@@ -347,44 +359,39 @@ export function buildOctree(
     const hy = 0.5 * (maxY - minY);
     const hz = 0.5 * (maxZ - minZ);
 
-    // default: mark as leaf
     let isLeaf = true;
-
     if (job.len > minLeaf) {
       counts.fill(0);
-      // count how many points go to each octant
+      // count how many points land in each octant
       for (let i = 0; i < job.len; i++) {
-        const idx = indices[job.start + i] * 3;
+        const vi = indices[job.start + i] * 3;
         let oct = 0;
-        if (p[idx] > cx) oct |= 1;
-        if (p[idx + 1] > cy) oct |= 2;
-        if (p[idx + 2] > cz) oct |= 4;
+        if (p[vi]     > cx) oct |= 1;
+        if (p[vi + 1] > cy) oct |= 2;
+        if (p[vi + 2] > cz) oct |= 4;
         counts[oct]++;
       }
       let nonEmpty = 0;
       for (let o = 0; o < 8; o++) {
         if (counts[o] > 0) nonEmpty++;
       }
-
       if (nonEmpty > 1) {
-        // can split into octants
         isLeaf = false;
-        // compute offsets
+        // compute prefix sums → offsets
         const offs = new Uint32Array(8);
-        for (let o = 1; o < 8; o++) {
-          offs[o] = offs[o - 1] + counts[o - 1];
-        }
-        const tmp = new Uint32Array(counts);
+        for (let o = 1; o < 8; o++) offs[o] = offs[o - 1] + counts[o - 1];
+        const tmp = counts.slice();
 
-        // pack into an intermediate array
+        // pack into a temporary array
         const packed = new Uint32Array(job.len);
         for (let i = 0; i < job.len; i++) {
-          const idx = indices[job.start + i] * 3;
+          const vi = indices[job.start + i] * 3;
           let oct = 0;
-          if (p[idx] > cx) oct |= 1;
-          if (p[idx + 1] > cy) oct |= 2;
-          if (p[idx + 2] > cz) oct |= 4;
-          packed[offs[oct] + (tmp[oct] - 1)] = indices[job.start + i];
+          if (p[vi]     > cx) oct |= 1;
+          if (p[vi + 1] > cy) oct |= 2;
+          if (p[vi + 2] > cz) oct |= 4;
+          const pos = offs[oct] + (tmp[oct] - 1);
+          packed[pos] = indices[job.start + i];
           tmp[oct]--;
         }
         // overwrite the region in indices
@@ -398,6 +405,7 @@ export function buildOctree(
           if (cnt === 0) continue;
           let childBox: [number, number, number, number, number, number];
           if (cubic) {
+            // always subdivide equally
             const minCx = minX + ((o & 1) ? hx : 0);
             const minCy = minY + ((o & 2) ? hy : 0);
             const minCz = minZ + ((o & 4) ? hz : 0);
@@ -410,23 +418,73 @@ export function buildOctree(
             const subIdx = indices.subarray(childStart, childStart + cnt);
             childBox = computeAABB(p, s, r, subIdx, cnt);
           }
-          stack.push({ start: job.start + offs[o], len: cnt, box: childBox });
+          stack.push({
+            start: job.start + offs[o],
+            len: cnt,
+            box: childBox,
+            parentIndex: jobList.length - 1,
+            leaf: false
+          });
         }
       }
     }
 
-    outBoxes.push(cx, cy, cz, hx, hy, hz);
-    leafFlagsArr.push(isLeaf ? 1 : 0);
+    job.leaf = isLeaf;
+  }
 
-    if (isLeaf) {
-      // copy leaf indices into a fresh Uint32Array
+  // 3) Assign nodeIndex to every job
+  const Nnodes = jobList.length;
+  for (let i = 0; i < Nnodes; i++) {
+    jobList[i].nodeIndex = i;
+  }
+
+  // 4) Build a childrenIndices array of length Nnodes
+  const childrenIndices: number[][] = Array.from({ length: Nnodes }, () => []);
+  for (let i = 0; i < Nnodes; i++) {
+    const job = jobList[i];
+    if (job.parentIndex >= 0) {
+      const pi = job.parentIndex;
+      childrenIndices[pi].push(job.nodeIndex as number);
+    }
+  }
+  // convert each childrenIndices[i] to a Uint32Array
+  const childrenIdxs: Uint32Array[] = childrenIndices.map(arr => new Uint32Array(arr));
+
+  // 5) Now build output arrays: data, leafFlags, leafIndices
+  const outBoxes: number[] = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
+  const leafFlagsArr: number[] = [];  // 1 or 0
+  const leafIndices: Uint32Array[] = [];
+
+  // childL/childR remain all -1
+  const childL = new Int32Array(Nnodes);
+  const childR = new Int32Array(Nnodes);
+  for (let i = 0; i < Nnodes; i++) {
+    childL[i] = -1;
+    childR[i] = -1;
+  }
+
+  // 6) Pass 2: fill outBoxes, leafFlagsArr, leafIndices
+  while (outBoxes.length < Nnodes * 6) {
+    const i = outBoxes.length / 6;
+    const job = jobList[i];
+    const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
+    const cx = 0.5 * (minX + maxX);
+    const cy = 0.5 * (minY + maxY);
+    const cz = 0.5 * (minZ + maxZ);
+    const hx = 0.5 * (maxX - minX);
+    const hy = 0.5 * (maxY - minY);
+    const hz = 0.5 * (maxZ - minZ);
+
+    outBoxes.push(cx, cy, cz, hx, hy, hz);
+    leafFlagsArr.push(job.leaf ? 1 : 0);
+
+    if (job.leaf) {
       const subIdx = indices.subarray(job.start, job.start + job.len);
       leafIndices.push(new Uint32Array(subIdx));
     }
   }
 
-  // flatten results into typed arrays
-  const Nnodes = outBoxes.length / 6;
+  // flatten outBoxes into Float32Array
   const data = new Float32Array(Nnodes * 6);
   for (let i = 0; i < Nnodes * 6; i++) {
     data[i] = outBoxes[i];
@@ -435,21 +493,286 @@ export function buildOctree(
   for (let i = 0; i < Nnodes; i++) {
     leafFlags[i] = leafFlagsArr[i];
   }
-  // child pointers are not used in this simple octree
-  const childL = new Int32Array(Nnodes);
-  const childR = new Int32Array(Nnodes);
-  for (let i = 0; i < Nnodes; i++) {
-    childL[i] = -1;
-    childR[i] = -1;
-  }
 
   return {
     data,
     leafFlags,
     childL,
     childR,
-    leafIndices
+    leafIndices,
+    childrenIdxs
   };
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   “Tree‐Traversal” helpers
+──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Descend a BVH to find the leaf node index that contains (x,y,z).
+ * Returns -1 if point falls outside the root AABB (i.e. no containment).
+ *
+ * @param data      Float32Array of length 6*Nnodes: [cx, cy, cz, hx, hy, hz] per node
+ * @param leafFlags Uint8Array of length Nnodes: 1 if leaf, 0 if internal
+ * @param childL    Int32Array of length Nnodes: left‐child index or -1
+ * @param childR    Int32Array of length Nnodes: right‐child index or -1
+ * @param x         point x‐coordinate
+ * @param y         point y‐coordinate
+ * @param z         point z‐coordinate
+ * @returns         index of leaf node containing (x,y,z), or -1 if none
+ */
+export function findLeafBVH(
+  data: Float32Array,
+  leafFlags: Uint8Array,
+  childL: Int32Array,
+  childR: Int32Array,
+  x: number, y: number, z: number
+): number {
+  let nodeIdx = 0;
+  while (true) {
+    // Check if leaf
+    if (leafFlags[nodeIdx] === 1) {
+      // We still should verify (x,y,z) is inside this leaf’s AABB—
+      // but if construction is correct, once you get here you know it was contained.
+      return nodeIdx;
+    }
+    // Otherwise, test left child first
+    const L = childL[nodeIdx];
+    if (L >= 0) {
+      const ld = L * 6;
+      const lcX = data[ld],   lcY = data[ld + 1], lcZ = data[ld + 2];
+      const lhX = data[ld + 3], lhY = data[ld + 4], lhZ = data[ld + 5];
+      if (
+        x >= lcX - lhX && x <= lcX + lhX &&
+        y >= lcY - lhY && y <= lcY + lhY &&
+        z >= lcZ - lhZ && z <= lcZ + lhZ
+      ) {
+        nodeIdx = L;
+        continue;
+      }
+    }
+    // Otherwise, try right child
+    const R = childR[nodeIdx];
+    if (R >= 0) {
+      const rd = R * 6;
+      const rcX = data[rd],   rcY = data[rd + 1], rcZ = data[rd + 2];
+      const rhX = data[rd + 3], rhY = data[rd + 4], rhZ = data[rd + 5];
+      if (
+        x >= rcX - rhX && x <= rcX + rhX &&
+        y >= rcY - rhY && y <= rcY + rhY &&
+        z >= rcZ - rhZ && z <= rcZ + rhZ
+      ) {
+        nodeIdx = R;
+        continue;
+      }
+    }
+    // If neither child contains the point, we are outside the entire root or rounding error
+    return -1;
+  }
+}
+
+/**
+ * Return the full root‐to‐leaf node‐index path in a BVH for (x,y,z).
+ * The returned array always begins with 0 (the root index) and ends with the leaf index.
+ * If the point is not contained in the root, returns an empty array.
+ *
+ * @param data      Float32Array of length 6*Nnodes
+ * @param leafFlags Uint8Array of length Nnodes
+ * @param childL    Int32Array of length Nnodes
+ * @param childR    Int32Array of length Nnodes
+ * @param x         point x‐coordinate
+ * @param y         point y‐coordinate
+ * @param z         point z‐coordinate
+ * @returns         array of node‐indices along the descent; [] if
+ *                  (x,y,z) is not in the BVH root.
+ */
+export function collectHierarchyBVH(
+  data: Float32Array,
+  leafFlags: Uint8Array,
+  childL: Int32Array,
+  childR: Int32Array,
+  x: number, y: number, z: number
+): number[] {
+  const path: number[] = [];
+  let nodeIdx = 0;
+
+  // First check root:
+  const rd0 = 0;
+  const cx0 = data[rd0], cy0 = data[rd0 + 1], cz0 = data[rd0 + 2];
+  const hx0 = data[rd0 + 3], hy0 = data[rd0 + 4], hz0 = data[rd0 + 5];
+  if (
+    x < cx0 - hx0 || x > cx0 + hx0 ||
+    y < cy0 - hy0 || y > cy0 + hy0 ||
+    z < cz0 - hz0 || z > cz0 + hz0
+  ) {
+    return []; // outside the root entirely
+  }
+
+  while (true) {
+    path.push(nodeIdx);
+    if (leafFlags[nodeIdx] === 1) {
+      break;
+    }
+    // check left child
+    const L = childL[nodeIdx];
+    if (L >= 0) {
+      const ld = L * 6;
+      const lcX = data[ld],   lcY = data[ld + 1], lcZ = data[ld + 2];
+      const lhX = data[ld + 3], lhY = data[ld + 4], lhZ = data[ld + 5];
+      if (
+        x >= lcX - lhX && x <= lcX + lhX &&
+        y >= lcY - lhY && y <= lcY + lhY &&
+        z >= lcZ - lhZ && z <= lcZ + lhZ
+      ) {
+        nodeIdx = L;
+        continue;
+      }
+    }
+    // otherwise, right child
+    const R = childR[nodeIdx];
+    if (R >= 0) {
+      const rd = R * 6;
+      const rcX = data[rd],   rcY = data[rd + 1], rcZ = data[rd + 2];
+      const rhX = data[rd + 3], rhY = data[rd + 4], rhZ = data[rd + 5];
+      if (
+        x >= rcX - rhX && x <= rcX + rhX &&
+        y >= rcY - rhY && y <= rcY + rhY &&
+        z >= rcZ - rhZ && z <= rcZ + rhZ
+      ) {
+        nodeIdx = R;
+        continue;
+      }
+    }
+    // If neither child matches (rounding or outside), we stop
+    break;
+  }
+
+  return path;
+}
+
+
+/**
+ * Descend an Octree to find the leaf node index containing (x,y,z).
+ * Returns -1 if point is not contained in the root or a child chain.
+ *
+ * @param data        Float32Array of length 6*Nnodes: [cx, cy, cz, hx, hy, hz] per node
+ * @param leafFlags   Uint8Array of length Nnodes: 1 if leaf, 0 if internal
+ * @param childrenIdxs Array of Uint32Array, length Nnodes: list of child node indices per internal node
+ * @param x           point x‐coordinate
+ * @param y           point y‐coordinate
+ * @param z           point z‐coordinate
+ * @returns           index of leaf node containing (x,y,z), or -1 if none
+ */
+export function findLeafOctree(
+  data: Float32Array,
+  leafFlags: Uint8Array,
+  childrenIdxs: Uint32Array[],
+  x: number, y: number, z: number
+): number {
+  let nodeIdx = 0;
+
+  // First verify the root contains (x,y,z):
+  const rd0 = 0;
+  const cx0 = data[rd0], cy0 = data[rd0 + 1], cz0 = data[rd0 + 2];
+  const hx0 = data[rd0 + 3], hy0 = data[rd0 + 4], hz0 = data[rd0 + 5];
+  if (
+    x < cx0 - hx0 || x > cx0 + hx0 ||
+    y < cy0 - hy0 || y > cy0 + hy0 ||
+    z < cz0 - hz0 || z > cz0 + hz0
+  ) {
+    return -1;
+  }
+
+  while (true) {
+    if (leafFlags[nodeIdx] === 1) {
+      return nodeIdx;
+    }
+    const children = childrenIdxs[nodeIdx];
+    let moved = false;
+    for (let i = 0, len = children.length; i < len; i++) {
+      const c = children[i];
+      const cd = c * 6;
+      const cx = data[cd], cy = data[cd + 1], cz = data[cd + 2];
+      const hx = data[cd + 3], hy = data[cd + 4], hz = data[cd + 5];
+      if (
+        x >= cx - hx && x <= cx + hx &&
+        y >= cy - hy && y <= cy + hy &&
+        z >= cz - hz && z <= cz + hz
+      ) {
+        nodeIdx = c;
+        moved = true;
+        break;
+      }
+    }
+    if (!moved) {
+      return -1;
+    }
+  }
+}
+
+/**
+ * Return the full root‐to‐leaf node‐index path in an Octree for (x,y,z).
+ * The returned array begins at 0 (root) and ends at the leaf index.
+ * If (x,y,z) is not contained in the root, returns an empty array.
+ *
+ * @param data         Float32Array of length 6*Nnodes
+ * @param leafFlags    Uint8Array of length Nnodes
+ * @param childrenIdxs Array of Uint32Array, length Nnodes
+ * @param x            point x‐coordinate
+ * @param y            point y‐coordinate
+ * @param z            point z‐coordinate
+ * @returns            array of node‐indices along the descent; [] if no containment
+ */
+export function collectHierarchyOctree(
+  data: Float32Array,
+  leafFlags: Uint8Array,
+  childrenIdxs: Uint32Array[],
+  x: number, y: number, z: number
+): number[] {
+  const path: number[] = [];
+  let nodeIdx = 0;
+
+  // First check root
+  const rd0 = 0;
+  const cx0 = data[rd0],   cy0 = data[rd0 + 1], cz0 = data[rd0 + 2];
+  const hx0 = data[rd0 + 3], hy0 = data[rd0 + 4], hz0 = data[rd0 + 5];
+  if (
+    x < cx0 - hx0 || x > cx0 + hx0 ||
+    y < cy0 - hy0 || y > cy0 + hy0 ||
+    z < cz0 - hz0 || z > cz0 + hz0
+  ) {
+    return [];
+  }
+
+  while (true) {
+    path.push(nodeIdx);
+    if (leafFlags[nodeIdx] === 1) {
+      break;
+    }
+    const children = childrenIdxs[nodeIdx];
+    let moved = false;
+    for (let i = 0, len = children.length; i < len; i++) {
+      const c = children[i];
+      const cd = c * 6;
+      const cx = data[cd],   cy = data[cd + 1], cz = data[cd + 2];
+      const hx = data[cd + 3], hy = data[cd + 4], hz = data[cd + 5];
+      if (
+        x >= cx - hx && x <= cx + hx &&
+        y >= cy - hy && y <= cy + hy &&
+        z >= cz - hz && z <= cz + hz
+      ) {
+        nodeIdx = c;
+        moved = true;
+        break;
+      }
+    }
+    if (!moved) {
+      break;
+    }
+  }
+
+  return path;
 }
 
 

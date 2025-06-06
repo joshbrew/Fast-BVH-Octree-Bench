@@ -1,24 +1,20 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
   <meta charset="UTF-8" />
-  <title>BVH / Octree + Worker Pool with Corrected Collision Logic</title>
+  <title>BVH / Octree + Worker Pool with Super‐Fast Tree Traversal</title>
   <style>
-    html,
-    body {
+    html, body {
       margin: 0;
       height: 100%;
       overflow: hidden;
       background: #dfe8ff;
     }
-
     #renderCanvas {
       width: 100%;
       height: 100%;
       display: block;
     }
-
     #ui {
       position: absolute;
       top: 8px;
@@ -30,12 +26,10 @@
       box-shadow: 0 2px 6px #0004;
       z-index: 10;
     }
-
     #ui label {
       display: block;
       margin-top: 4px;
     }
-
     /* Collision table styling */
     #collisionTable {
       position: absolute;
@@ -50,19 +44,16 @@
       font-size: 12px;
       z-index: 10;
     }
-
     /* Table row pointer */
     #collisionTable tr[data-node] {
       cursor: pointer;
     }
-
     /* Highlighted row background */
     #collisionTable tr.highlighted {
       background-color: #ffff99;
     }
   </style>
 </head>
-
 <body>
   <canvas id="renderCanvas"></canvas>
 
@@ -90,12 +81,11 @@
   <!-- ────────────── WORKER CODE (inline) ────────────── -->
   <script id="oct-worker" type="javascript/worker">
     // Highly-optimized BVH/Octree builder as a standalone Web Worker
-  
     const EPS = Number.EPSILON;
-  
+
     /** Compute AABB over a subset of points */
     function computeAABB(p, s, r, idx, len) {
-      let xmin =  1e9, ymin =  1e9, zmin =  1e9;
+      let xmin = 1e9, ymin = 1e9, zmin = 1e9;
       let xmax = -1e9, ymax = -1e9, zmax = -1e9;
       for (let i = 0; i < len; i++) {
         const vi = idx[i] * 3;
@@ -114,7 +104,7 @@
       }
       return [xmin, ymin, zmin, xmax, ymax, zmax];
     }
-  
+
     /** Build a BVH over points (with child pointers) */
     function buildBVH(p, s, r, minLeaf) {
       const N = p.length / 3;
@@ -127,13 +117,13 @@
           leafIndices: []
         };
       }
-  
+
       // 1) Create one master indices buffer
       const indices = new Uint32Array(N);
       for (let i = 0; i < N; i++) indices[i] = i;
-  
+
       // Job structure for iterative splitting
-      function Job(start, len, parentIndex, isLeft) {
+      function JobBVH(start, len, parentIndex, isLeft) {
         this.start = start;        // start offset into indices
         this.len = len;            // number of points
         this.parentIndex = parentIndex;  // index into jobList or -1
@@ -141,19 +131,19 @@
         this.leaf = false;         // set later
         this.nodeIndex = -1;       // set after jobList is full
       }
-  
+
       const jobList = [];
       const stack = [];
-      stack.push(new Job(0, N, -1, false));
-  
+      stack.push(new JobBVH(0, N, -1, false));
+
       // 2) First pass: gather all jobs and partition indices in place
       while (stack.length > 0) {
         const job = stack.pop();
         jobList.push(job);
-  
+
         const currStart = job.start;
         const currLen = job.len;
-  
+
         // Compute bounding box to choose split axis
         const box = computeAABB(
           p,
@@ -168,7 +158,7 @@
         const hx = 0.5 * (box[3] - box[0]);
         const hy = 0.5 * (box[4] - box[1]);
         const hz = 0.5 * (box[5] - box[2]);
-  
+
         let isLeaf = true;
         if (currLen > minLeaf) {
           // pick axis with largest span
@@ -177,7 +167,7 @@
             axis = 2;
           }
           const midVal = axis === 0 ? cx : axis === 1 ? cy : cz;
-  
+
           // partition in place so that indices ≤ midVal come first
           let leftWrite = currStart;
           for (let i = currStart; i < currStart + currLen; i++) {
@@ -191,42 +181,41 @@
           }
           const leftCount = leftWrite - currStart;
           const rightCount = currLen - leftCount;
-  
+
           if (leftCount >= minLeaf && rightCount >= minLeaf) {
             isLeaf = false;
             // push right child first so left is processed last (stack LIFO)
-            stack.push(new Job(currStart + leftCount, rightCount, jobList.length - 1, false));
-            stack.push(new Job(currStart, leftCount, jobList.length - 1, true));
+            stack.push(new JobBVH(currStart + leftCount, rightCount, jobList.length - 1, false));
+            stack.push(new JobBVH(currStart, leftCount, jobList.length - 1, true));
           }
         }
         job.leaf = isLeaf;
       }
-  
+
       // 3) Assign nodeIndex to each job
       const Nnodes = jobList.length;
       for (let i = 0; i < Nnodes; i++) {
         jobList[i].nodeIndex = i;
       }
-  
+
       // 4) Allocate output arrays
       const data = new Float32Array(Nnodes * 6);    // [cx, cy, cz, hx, hy, hz]
       const leafFlags = new Uint8Array(Nnodes);     // 1 if leaf
       const childL = new Int32Array(Nnodes);        // left child idx
       const childR = new Int32Array(Nnodes);        // right child idx
       const leafIndices = [];
-  
       for (let i = 0; i < Nnodes; i++) {
         childL[i] = -1;
         childR[i] = -1;
       }
-  
+
       // 5) Second pass: fill in node bounds, flags, children, leafIndices
       for (let i = 0; i < Nnodes; i++) {
         const job = jobList[i];
         const start = job.start;
         const len = job.len;
         const subIdx = indices.subarray(start, start + len);
-  
+
         const box = computeAABB(p, s, r, subIdx, len);
         const cx = 0.5 * (box[0] + box[3]);
         const cy = 0.5 * (box[1] + box[4]);
@@ -234,7 +223,7 @@
         const hx = 0.5 * (box[3] - box[0]);
         const hy = 0.5 * (box[4] - box[1]);
         const hz = 0.5 * (box[5] - box[2]);
-  
+
         const offset = i * 6;
         data[offset]     = cx;
         data[offset + 1] = cy;
@@ -242,13 +231,12 @@
         data[offset + 3] = hx;
         data[offset + 4] = hy;
         data[offset + 5] = hz;
-  
+
         leafFlags[i] = job.leaf ? 1 : 0;
         if (job.leaf) {
-          // copy leaf indices into new Uint32Array
           leafIndices.push(new Uint32Array(subIdx));
         }
-  
+
         if (job.parentIndex >= 0) {
           const parentNodeIndex = jobList[job.parentIndex].nodeIndex;
           if (job.isLeft) {
@@ -258,237 +246,251 @@
           }
         }
       }
-  
+
       return { data, leafFlags, childL, childR, leafIndices };
     }
-  
-    /** Build a (pointer-free) Octree over points */
-function buildOctree(p, s, r, minLeaf, cubic) {
-  const N = p.length / 3;
-  if (N === 0) {
-    return {
-      data: new Float32Array(0),
-      leafFlags: new Uint8Array(0),
-      childL: new Int32Array(0),
-      childR: new Int32Array(0),
-      leafIndices: []             // return an empty leafIndices array for N=0
-    };
-  }
 
-  // one master indices buffer
-  const indices = new Uint32Array(N);
-  for (let i = 0; i < N; i++) indices[i] = i;
-
-  // compute root bounding box
-  let rootBox = computeAABB(p, s, r, indices, N);
-  if (cubic) {
-    const sizeX = rootBox[3] - rootBox[0];
-    const sizeY = rootBox[4] - rootBox[1];
-    const sizeZ = rootBox[5] - rootBox[2];
-    const size = Math.max(sizeX, sizeY, sizeZ);
-    const cx = 0.5 * (rootBox[0] + rootBox[3]);
-    const cy = 0.5 * (rootBox[1] + rootBox[4]);
-    const cz = 0.5 * (rootBox[2] + rootBox[5]);
-    rootBox = [
-      cx - 0.5 * size, cy - 0.5 * size, cz - 0.5 * size,
-      cx + 0.5 * size, cy + 0.5 * size, cz + 0.5 * size
-    ];
-  }
-
-  function OTJob(start, len, box) {
-    this.start = start;
-    this.len = len;
-    this.box = box;  // [minX, minY, minZ, maxX, maxY, maxZ]
-  }
-
-  const stack = [];
-  const outBoxes = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
-  const leafFlagsArr = [];  // parallel array of 1/0
-  const leafIndices = [];   // ← NEW: collect each leaf’s point‐indices
-
-  stack.push(new OTJob(0, N, rootBox));
-  const counts = new Uint32Array(8);
-
-  // iterative loop
-  while (stack.length > 0) {
-    const job = stack.pop();
-    const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
-    const cx = 0.5 * (minX + maxX);
-    const cy = 0.5 * (minY + maxY);
-    const cz = 0.5 * (minZ + maxZ);
-    const hx = 0.5 * (maxX - minX);
-    const hy = 0.5 * (maxY - minY);
-    const hz = 0.5 * (maxZ - minZ);
-
-    let isLeaf = true;
-    if (job.len > minLeaf) {
-      counts.fill(0);
-      // count points per octant
-      for (let i = 0; i < job.len; i++) {
-        const vi = indices[job.start + i] * 3;
-        let oct = 0;
-        if (p[vi]     > cx) oct |= 1;
-        if (p[vi + 1] > cy) oct |= 2;
-        if (p[vi + 2] > cz) oct |= 4;
-        counts[oct]++;
+    /** Build a (pointer‐free) Octree over points, but track parent/child pointers */
+    function buildOctree(p, s, r, minLeaf, cubic) {
+      const N = p.length / 3;
+      if (N === 0) {
+        return {
+          data: new Float32Array(0),
+          leafFlags: new Uint8Array(0),
+          childrenIdxs: [],      // no nodes ⇒ no children
+          leafIndices: []        // no leaves
+        };
       }
-      let nonEmpty = 0;
-      for (let o = 0; o < 8; o++) {
-        if (counts[o] > 0) nonEmpty++;
-      }
-      if (nonEmpty > 1) {
-        isLeaf = false;
-        // prefix sums for offsets
-        const offs = new Uint32Array(8);
-        for (let o = 1; o < 8; o++) {
-          offs[o] = offs[o - 1] + counts[o - 1];
-        }
-        const tmp = counts.slice();
-        const packed = new Uint32Array(job.len);
-        // pack into temp buffer
-        for (let i = 0; i < job.len; i++) {
-          const vi = indices[job.start + i] * 3;
-          let oct = 0;
-          if (p[vi]     > cx) oct |= 1;
-          if (p[vi + 1] > cy) oct |= 2;
-          if (p[vi + 2] > cz) oct |= 4;
-          const pos = offs[oct] + (tmp[oct] - 1);
-          packed[pos] = indices[job.start + i];
-          tmp[oct]--;
-        }
-        // overwrite the region in indices
-        for (let i = 0; i < job.len; i++) {
-          indices[job.start + i] = packed[i];
-        }
 
-        // spawn child jobs for each nonempty octant
-        for (let o = 0; o < 8; o++) {
-          const cnt = counts[o];
-          if (cnt === 0) continue;
-          let childBox;
-          if (cubic) {
-            const minCx = minX + ((o & 1) ? hx : 0);
-            const minCy = minY + ((o & 2) ? hy : 0);
-            const minCz = minZ + ((o & 4) ? hz : 0);
-            const maxCx = minX + ((o & 1) ? hx * 2 : hx);
-            const maxCy = minY + ((o & 2) ? hy * 2 : hy);
-            const maxCz = minZ + ((o & 4) ? hz * 2 : hz);
-            childBox = [minCx, minCy, minCz, maxCx, maxCy, maxCz];
-          } else {
-            const childStart = job.start + offs[o];
-            const subIdx = indices.subarray(childStart, childStart + cnt);
-            childBox = computeAABB(p, s, r, subIdx, cnt);
+      // One master indices buffer
+      const indices = new Uint32Array(N);
+      for (let i = 0; i < N; i++) indices[i] = i;
+
+      // Compute root bounding box
+      let rootBox = computeAABB(p, s, r, indices, N);
+      if (cubic) {
+        const sizeX = rootBox[3] - rootBox[0];
+        const sizeY = rootBox[4] - rootBox[1];
+        const sizeZ = rootBox[5] - rootBox[2];
+        const size = Math.max(sizeX, sizeY, sizeZ);
+        const cx = 0.5 * (rootBox[0] + rootBox[3]);
+        const cy = 0.5 * (rootBox[1] + rootBox[4]);
+        const cz = 0.5 * (rootBox[2] + rootBox[5]);
+        rootBox = [
+          cx - 0.5 * size, cy - 0.5 * size, cz - 0.5 * size,
+          cx + 0.5 * size, cy + 0.5 * size, cz + 0.5 * size
+        ];
+      }
+
+      // Job structure for octree
+      function JobOT(start, len, box, parentIndex) {
+        this.start = start;        // start offset into indices
+        this.len = len;            // number of points
+        this.box = box;            // [minX, minY, minZ, maxX, maxY, maxZ]
+        this.parentIndex = parentIndex; // index in jobList
+        this.nodeIndex = -1;        // assigned later
+        this.leaf = false;         // assigned in pass
+      }
+
+      const jobList = [];
+      const stack = [];
+      stack.push(new JobOT(0, N, rootBox, -1));
+
+      // 1) Gather all jobs first (breadth‐independent), track parentIndex
+      while (stack.length > 0) {
+        const job = stack.pop();
+        jobList.push(job);
+
+        const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
+        const cx = 0.5 * (minX + maxX);
+        const cy = 0.5 * (minY + maxY);
+        const cz = 0.5 * (minZ + maxZ);
+        const hx = 0.5 * (maxX - minX);
+        const hy = 0.5 * (maxY - minY);
+        const hz = 0.5 * (maxZ - minZ);
+
+        let isLeaf = true;
+        if (job.len > minLeaf) {
+          // Count points per octant
+          const counts = new Uint32Array(8);
+          for (let i = 0; i < job.len; i++) {
+            const vi = indices[job.start + i] * 3;
+            let oct = 0;
+            if (p[vi]     > cx) oct |= 1;
+            if (p[vi + 1] > cy) oct |= 2;
+            if (p[vi + 2] > cz) oct |= 4;
+            counts[oct]++;
           }
-          stack.push(new OTJob(job.start + offs[o], cnt, childBox));
+          let nonEmpty = 0;
+          for (let o = 0; o < 8; o++) {
+            if (counts[o] > 0) nonEmpty++;
+          }
+          if (nonEmpty > 1) {
+            isLeaf = false;
+            // Compute prefix sums
+            const offs = new Uint32Array(8);
+            for (let o = 1; o < 8; o++) offs[o] = offs[o - 1] + counts[o - 1];
+            const tmp = counts.slice();
+            const packed = new Uint32Array(job.len);
+            // Pack into temp buffer
+            for (let i = 0; i < job.len; i++) {
+              const vi = indices[job.start + i] * 3;
+              let oct = 0;
+              if (p[vi]     > cx) oct |= 1;
+              if (p[vi + 1] > cy) oct |= 2;
+              if (p[vi + 2] > cz) oct |= 4;
+              const pos = offs[oct] + (tmp[oct] - 1);
+              packed[pos] = indices[job.start + i];
+              tmp[oct]--;
+            }
+            // Overwrite region in indices
+            for (let i = 0; i < job.len; i++) {
+              indices[job.start + i] = packed[i];
+            }
+
+            // Spawn child jobs for each nonempty octant
+            for (let o = 0; o < 8; o++) {
+              const cnt = counts[o];
+              if (cnt === 0) continue;
+              let childBox;
+              if (cubic) {
+                // Always subdivide equally
+                const minCx = minX + ((o & 1) ? hx : 0);
+                const minCy = minY + ((o & 2) ? hy : 0);
+                const minCz = minZ + ((o & 4) ? hz : 0);
+                const maxCx = minX + ((o & 1) ? hx * 2 : hx);
+                const maxCy = minY + ((o & 2) ? hy * 2 : hy);
+                const maxCz = minZ + ((o & 4) ? hz * 2 : hz);
+                childBox = [minCx, minCy, minCz, maxCx, maxCy, maxCz];
+              } else {
+                const childStart = job.start + offs[o];
+                const subIdx = indices.subarray(childStart, childStart + cnt);
+                childBox = computeAABB(p, s, r, subIdx, cnt);
+              }
+              stack.push(new JobOT(job.start + offs[o], cnt, childBox, jobList.length - 1));
+            }
+          }
+        }
+        job.leaf = isLeaf;
+      }
+
+      // 2) Assign nodeIndex to each job in jobList
+      const Nnodes = jobList.length;
+      for (let i = 0; i < Nnodes; i++) {
+        jobList[i].nodeIndex = i;
+      }
+
+      // 3) Build a childrenIndices array of length Nnodes
+      // Each entry is a standard JavaScript array; we'll convert to Uint32Array later
+      const childrenIndices = new Array(Nnodes);
+      for (let i = 0; i < Nnodes; i++) {
+        childrenIndices[i] = [];
+      }
+      for (let i = 0; i < Nnodes; i++) {
+        const job = jobList[i];
+        if (job.parentIndex >= 0) {
+          const pi = job.parentIndex;
+          childrenIndices[pi].push(job.nodeIndex);
         }
       }
+      // Convert each childrenIndices[i] to a Uint32Array
+      const childrenIdxs = childrenIndices.map(arr => new Uint32Array(arr));
+
+      // 4) Now build output arrays: data, leafFlags, leafIndices
+      const outBoxes = [];      // flattened [cx,cy,cz,hx,hy,hz,...]
+      const leafFlagsArr = [];  // parallel array of 1/0
+      const leafIndices = [];
+
+      for (let i = 0; i < Nnodes; i++) {
+        const job = jobList[i];
+        const [minX, minY, minZ, maxX, maxY, maxZ] = job.box;
+        const cx = 0.5 * (minX + maxX);
+        const cy = 0.5 * (minY + maxY);
+        const cz = 0.5 * (minZ + maxZ);
+        const hx = 0.5 * (maxX - minX);
+        const hy = 0.5 * (maxY - minY);
+        const hz = 0.5 * (maxZ - minZ);
+
+        outBoxes.push(cx, cy, cz, hx, hy, hz);
+        leafFlagsArr.push(job.leaf ? 1 : 0);
+
+        if (job.leaf) {
+          const subIdx = indices.subarray(job.start, job.start + job.len);
+          leafIndices.push(new Uint32Array(subIdx));
+        }
+      }
+
+      const data = new Float32Array(Nnodes * 6);
+      for (let i = 0; i < Nnodes * 6; i++) {
+        data[i] = outBoxes[i];
+      }
+      const leafFlags = new Uint8Array(Nnodes);
+      for (let i = 0; i < Nnodes; i++) {
+        leafFlags[i] = leafFlagsArr[i];
+      }
+
+      return {
+        data,             // Float32Array(6 * Nnodes)
+        leafFlags,        // Uint8Array(Nnodes)
+        childrenIdxs,     // Array<Uint32Array> for each node’s children
+        leafIndices       // Array<Uint32Array> for each leaf’s contained points
+      };
     }
 
-    outBoxes.push(cx, cy, cz, hx, hy, hz);
-    leafFlagsArr.push(isLeaf ? 1 : 0);
-
-    if (isLeaf) {
-      // ← ADDED: capture exactly which point‐indices landed in this leaf
-      const subIdx = indices.subarray(job.start, job.start + job.len);
-      leafIndices.push(new Uint32Array(subIdx));
-    }
-  }
-
-  // flatten results into typed arrays
-  const Nnodes = outBoxes.length / 6;
-  const data = new Float32Array(Nnodes * 6);
-  for (let i = 0; i < Nnodes * 6; i++) {
-    data[i] = outBoxes[i];
-  }
-  const leafFlags = new Uint8Array(Nnodes);
-  for (let i = 0; i < Nnodes; i++) {
-    leafFlags[i] = leafFlagsArr[i];
-  }
-  const childL = new Int32Array(Nnodes);
-  const childR = new Int32Array(Nnodes);
-  for (let i = 0; i < Nnodes; i++) {
-    childL[i] = -1;
-    childR[i] = -1;
-  }
-
-  return {
-    data,
-    leafFlags,
-    childL,
-    childR,
-    leafIndices    // ← RETURN the collected leaf index‐lists
-  };
-}
-
-  
     /** Worker message handler */
     self.onmessage = function(e) {
-      const { version, structure, minLeaf, pos, scl, rad, cubic, t0 } = e.data;
-      
-  const startTime = performance.now();
-      
+      const { version, structure, minLeaf, pos, scl, rad, cubic } = e.data;
+      const startTime = performance.now();
+
       if (structure === "bvh") {
         // Build BVH
         const result = buildBVH(pos, scl, rad, minLeaf);
-        const Nnodes = result.data.length / 6;
-        const data = result.data;
-        const leafArr = result.leafFlags;
-        const childL = result.childL;
-        const childR = result.childR;
-        const leafIdxs = result.leafIndices;
-  
-        // Prepare postMessage with transferable buffers
+        const { data, leafFlags, childL, childR, leafIndices } = result;
+        const Nnodes = leafFlags.length;
+
         self.postMessage(
           {
             version,
             buildTime: performance.now() - startTime,
-            data,        // Float32Array(6 * Nnodes)
-            leaf: leafArr,// Uint8Array(Nnodes)
-            childL,      // Int32Array(Nnodes)
-            childR,      // Int32Array(Nnodes)
-            leafIdxs     // Array<Uint32Array>
+            data,          // Float32Array(6 * Nnodes)
+            leaf: leafFlags,   // Uint8Array(Nnodes)
+            childL,        // Int32Array(Nnodes)
+            childR,        // Int32Array(Nnodes)
+            leafIdxs: leafIndices // Array<Uint32Array>
           },
           [
             data.buffer,
-            leafArr.buffer,
+            leafFlags.buffer,
             childL.buffer,
             childR.buffer,
-            ...leafIdxs.map(arr => arr.buffer)
+            ...leafIndices.map(arr => arr.buffer)
           ]
         );
       } else {
-        // Build Octree
+        // Build Octree (adaptive or cubic)
         const result = buildOctree(pos, scl, rad, minLeaf, cubic);
-        const Nnodes = result.data.length / 6;
-        const data = result.data;
-        const leafArr = result.leafFlags;
-        const childL = result.childL;
-        const childR = result.childR;
-        const leafIdxs = result.leafIndices;  // ← new
-      
+        const { data, leafFlags, childrenIdxs, leafIndices } = result;
+        const Nnodes = leafFlags.length;
+
         self.postMessage(
           {
             version,
             buildTime: performance.now() - startTime,
-            data,             // Float32Array(6 * Nnodes)
-            leaf: leafArr,    // Uint8Array(Nnodes)
-            childL,           // Int32Array(Nnodes)
-            childR,           // Int32Array(Nnodes)
-            leafIdxs          // Array<Uint32Array> for octree
+            data,            // Float32Array(6 * Nnodes)
+            leaf: leafFlags, // Uint8Array(Nnodes)
+            childrenIdxs,    // Array<Uint32Array> children lists
+            leafIdxs: leafIndices // Array<Uint32Array>
           },
           [
             data.buffer,
-            leafArr.buffer,
-            childL.buffer,
-            childR.buffer,
-            ...leafIdxs.map(arr => arr.buffer)  // transfer each leafIndices’ buffer
+            leafFlags.buffer,
+            ...childrenIdxs.map(arr => arr.buffer),
+            ...leafIndices.map(arr => arr.buffer)
           ]
         );
       }
-      
     };
   </script>
-
   <!-- ────────────── /worker ────────────── -->
 
   <script src="https://cdn.jsdelivr.net/npm/babylonjs@6.39.0/babylon.js"></script>
@@ -554,8 +556,8 @@ function buildOctree(p, s, r, minLeaf, cubic) {
     /* ---------- point generator ------------------------------------------- */
     function genPoints(n) {
       const pos = new Float32Array(n * 3),
-        scl = new Float32Array(n * 3),
-        rad = new Float32Array(n);
+            scl = new Float32Array(n * 3),
+            rad = new Float32Array(n);
       for (let i = 0; i < n; i++) {
         const o = i * 3;
         pos[o] = Math.random() * 200 - 100;
@@ -571,7 +573,7 @@ function buildOctree(p, s, r, minLeaf, cubic) {
     /* ---------- worker-pool ------------------------------------------------ */
     const workerURL = URL.createObjectURL(
       new Blob([document.getElementById("oct-worker").textContent],
-        { type: "application/javascript" })
+           { type: "application/javascript" })
     );
     class WorkerPool {
       constructor(url, max = 8) {
@@ -599,29 +601,30 @@ function buildOctree(p, s, r, minLeaf, cubic) {
         const { msg, cb } = this.queue.shift();
         const w = this.free.pop();
         w._cb = cb;
-        msg.t0 = performance.now();
         w.postMessage(msg, [msg.pos.buffer, msg.scl.buffer, msg.rad.buffer]);
       }
     }
     const pool = new WorkerPool(workerURL, 8);
     const runWorker = (task, cb) => pool.run(task, cb);
 
-    /* ---------- BVH data & leaf records ----------------------------------- */
-    let nodeData = null;   // Float32Array: [cx, cy, cz, hx, hy, hz] × nodeCount
-    let isLeafArr = null;   // Uint8Array: leaf=1 / internal=0
-    let childLArr = null;   // Int32Array: left child index or -1
-    let childRArr = null;   // Int32Array: right child index or -1
-    let leafIndicesArray = null;   // Array<Uint32Array>: indices per leaf
-    let leafNodesRecords = [];     // [{min:[x,y,z], max:[x,y,z], indices:Uint32Array, nodeIndex}, …]
+    /* ---------- BVH/Octree data & leaf records --------------------------- */
+    let nodeData = null;      // Float32Array: [cx, cy, cz, hx, hy, hz] × nodeCount
+    let isLeafArr = null;     // Uint8Array: leaf=1 / internal=0
+    let childLArr = null;     // Int32Array for BVH only
+    let childRArr = null;     // Int32Array for BVH only
+    let octChildrenIndices = null; // Array<Uint32Array> for octree only
+    let leafContents = null;      // Array<Uint32Array>, indexed by nodeIndex if leaf
+    let leafNodesRecords = [];    // ← no longer used for descent
     let highlightedLeafIndex = null;   // currently highlighted node index
+    let currentStructure = "bvh";
 
-    /* ---------- collision info table container ----------------------------- */
+    /* ---------- collision info table container --------------------------- */
     const collisionDiv = document.getElementById("collisionTable");
 
-    /* ---------- single “highlight box” (non-instanced) -------------------- */
+    /* ---------- single “highlight box” (non-instanced) --------------------- */
     let highlightBoxMesh = null;
 
-    /* ---------- UI & rebuild ---------------------------------------------- */
+    /* ---------- UI & rebuild ----------------------------------------------- */
     const sel = document.getElementById("structure");
     const minIn = document.getElementById("minLeaf");
     const numIn = document.getElementById("numPts");
@@ -636,6 +639,7 @@ function buildOctree(p, s, r, minLeaf, cubic) {
       const n = +numIn.value;
       currentPts = genPoints(n);
       version++;
+      currentStructure = sel.value;
 
       const posCopy = new Float32Array(currentPts.pos);
       const sclCopy = new Float32Array(currentPts.scl);
@@ -652,41 +656,48 @@ function buildOctree(p, s, r, minLeaf, cubic) {
       }, e => {
         if (e.data.version !== version) return;  // ignore stale
 
-        const { data, leaf, childL, childR, buildTime, leafIdxs } = e.data;
+        const { data, leaf, buildTime, leafIdxs } = e.data;
         const nodeCount = leaf.length;
         const nPts = currentPts.pos.length / 3;
 
         nodeData = data;           // Float32Array(6 * nodeCount)
-        isLeafArr = leaf;           // Uint8Array(nodeCount)
-        childLArr = childL;         // Int32Array(nodeCount)
-        childRArr = childR;         // Int32Array(nodeCount)
-        leafIndicesArray = leafIdxs;       // Array<Uint32Array>
+        isLeafArr = leaf;          // Uint8Array(nodeCount)
 
-        // Build leafNodesRecords (with nodeIndex)
-        leafNodesRecords = [];
-        let leafCounter = 0;
+        // Build a direct map: nodeIndex → its points (only valid if leaf)
+        leafContents = new Array(nodeCount);
+        for (let i = 0; i < nodeCount; i++) {
+          leafContents[i] = undefined;
+        }
+        // leafIdxs is an array of Uint32Array, one entry per leaf, in builder’s leaf order.
+        // But we don’t know leaf order in jobList here—so we must rely on “leafNodesRecords”:
+        // We iterate all nodeIndices and pick out which are leaves in index order,
+        // and assign leafIdxs in that same order.
+        let leafCountSoFar = 0;
         for (let i = 0; i < nodeCount; i++) {
           if (isLeafArr[i] === 1) {
-            const d = i * 6;
-            const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
-            const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
-            const minX = cx - hx, minY = cy - hy, minZ = cz - hz;
-            const maxX = cx + hx, maxY = cy + hy, maxZ = cz + hz;
-            leafNodesRecords.push({
-              min: [minX, minY, minZ],
-              max: [maxX, maxY, maxZ],
-              indices: leafIndicesArray[leafCounter++] || new Uint32Array(),
-              nodeIndex: i
-            });
+            leafContents[i] = leafIdxs[leafCountSoFar++];
           }
         }
+
+        if (sel.value === "bvh") {
+          childLArr = e.data.childL;   // Int32Array(nodeCount)
+          childRArr = e.data.childR;   // Int32Array(nodeCount)
+          octChildrenIndices = null;
+        } else {
+          childLArr = null;
+          childRArr = null;
+          octChildrenIndices = e.data.childrenIdxs; // Array<Uint32Array>
+        }
+
+        // We no longer need “leafNodesRecords” for descent. We only highlight boxes after a collision:
+        leafNodesRecords = []; // cleared
 
         // Dispose old highlight box
         if (highlightBoxMesh) {
           highlightBoxMesh.dispose();
           highlightBoxMesh = null;
+          highlightedLeafIndex = null;
         }
-        highlightedLeafIndex = null;
 
         // Populate point cloud
         ensure(ptInst, ptT, nPts);
@@ -701,7 +712,7 @@ function buildOctree(p, s, r, minLeaf, cubic) {
           m.scaling.set(2, 2, 2);
         }
 
-        // Populate BVH cubes (leaf and internal)
+        // Populate BVH/Octree boxes (leaf and internal)
         let leafCnt = 0, intCnt = 0;
         for (const f of isLeafArr) {
           if (f) leafCnt++;
@@ -730,18 +741,17 @@ function buildOctree(p, s, r, minLeaf, cubic) {
     /* ---------- Ball & Collision Logic ------------------------------------ */
     let ballMesh = null;
     let ballVelocity = new BABYLON.Vector3();
-    const ballSpeed = 200;          // units/sec
-    const ballRadius = 2;            // sphere diameter=4
+    const ballSpeed = 200;       // units/sec
+    const ballRadius = 2;        // sphere radius=2 (diameter=4)
     let isBallActive = false;
     let ballSpawnTime = 0;
-    const ballMaxLifetime = 5000;     // ms
+    const ballMaxLifetime = 5000; // ms
 
     function shootBall() {
       if (!nodeData) {
-        console.warn("BVH not built yet. Rebuild and try again.");
+        console.warn("BVH/Octree not built yet. Rebuild and try again.");
         return;
       }
-
       // Dispose old ball
       if (ballMesh) {
         ballMesh.dispose();
@@ -750,7 +760,9 @@ function buildOctree(p, s, r, minLeaf, cubic) {
 
       // Create new ball at camera
       const camPos = cam.position.clone();
-      ballMesh = BABYLON.MeshBuilder.CreateSphere("ball", { diameter: ballRadius * 2 }, scene);
+      ballMesh = BABYLON.MeshBuilder.CreateSphere(
+        "ball", { diameter: ballRadius * 2 }, scene
+      );
       ballMesh.position.copyFrom(camPos);
       ballMesh.material = new BABYLON.StandardMaterial("ballMat", scene);
       ballMesh.material.diffuseColor.set(0.8, 0.2, 0.2);
@@ -785,116 +797,76 @@ function buildOctree(p, s, r, minLeaf, cubic) {
       const delta = engine.getDeltaTime() / 1000;
       ballMesh.position.addInPlace(ballVelocity.scale(delta));
 
-      console.time("Tree Traversal");
-      // --- Find collided leaf (O(#leaves)) ---
-      let collidedLeafRecord = null;
-      for (const rec of leafNodesRecords) {
-        const [minX, minY, minZ] = rec.min;
-        const [maxX, maxY, maxZ] = rec.max;
-        if (
-          ballMesh.position.x >= minX && ballMesh.position.x <= maxX &&
-          ballMesh.position.y >= minY && ballMesh.position.y <= maxY &&
-          ballMesh.position.z >= minZ && ballMesh.position.z <= maxZ
-        ) {
-          collidedLeafRecord = rec;
-          break;
-        }
+      console.time("Tree Descent");
+      // --- Find collided leaf via tree descent (O(depth)) ---
+      let collidedLeafNodeIndex = -1;
+      if (currentStructure === "bvh") {
+        collidedLeafNodeIndex = findLeafBVH(ballMesh.position);
+      } else {
+        collidedLeafNodeIndex = findLeafOct(ballMesh.position);
       }
-      if (!collidedLeafRecord) {
-        // Not yet inside any leaf
-        console.timeEnd("Tree Traversal");
+      console.timeEnd("Tree Descent");
+
+      if (collidedLeafNodeIndex < 0) {
+        // Not inside any leaf (shouldn't happen if scene large enough)
         return;
       }
-
-      const collidedLeafNodeIndex = collidedLeafRecord.nodeIndex;
 
       // --- Check particles in that leaf for actual collision ---
-      const indices = collidedLeafRecord.indices;
-      let particleHit = -1;
-      const pxArr = currentPts.pos;
-      const prArr = currentPts.rad;
-      const pos = ballMesh.position;
-      for (let i = 0; i < indices.length; i++) {
-        const idx = indices[i];
-        const px = pxArr[3 * idx];
-        const py = pxArr[3 * idx + 1];
-        const pz = pxArr[3 * idx + 2];
-        const dx = pos.x - px;
-        const dy = pos.y - py;
-        const dz = pos.z - pz;
-        const distSq = dx * dx + dy * dy + dz * dz;
-        const radiusSum = ballRadius + prArr[idx];
-        if (distSq <= radiusSum * radiusSum) {
-          particleHit = idx;
-          break;
-        }
-      }
-      console.timeEnd("Tree Traversal");
-      if (particleHit < 0) {
-        // No orb‐collision yet; continue traveling
-        // Optionally highlight current leaf
-        if (highlightBoxMesh && highlightedLeafIndex !== collidedLeafNodeIndex) {
-          highlightBoxMesh.dispose();
-          highlightBoxMesh = null;
-        }
-        if (!highlightBoxMesh || highlightedLeafIndex !== collidedLeafNodeIndex) {
-          const d = collidedLeafNodeIndex * 6;
-          const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
-          const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
-          highlightBoxMesh = BABYLON.MeshBuilder.CreateBox(
-            "highlightBox",
-            { width: hx * 2, height: hy * 2, depth: hz * 2 },
-            scene
-          );
-          highlightBoxMesh.position.set(cx, cy, cz);
-          highlightBoxMesh.material = matHighlight;
-          highlightBoxMesh.renderingGroupId = 1;
-          highlightedLeafIndex = collidedLeafNodeIndex;
-        }
-        return;
-      }
-
-      // --- Actual orb collision occurred! Build hierarchy path (O(depth)) ---
-      function collectHierarchy(point) {
-        const path = [];
-        function recurse(nodeIndex) {
-          path.push(nodeIndex);
-          if (isLeafArr[nodeIndex] === 0) {
-            const L = childLArr[nodeIndex];
-            if (L >= 0) {
-              const ld = L * 6;
-              const lcX = nodeData[ld], lcY = nodeData[ld + 1], lcZ = nodeData[ld + 2];
-              const lhX = nodeData[ld + 3], lhY = nodeData[ld + 4], lhZ = nodeData[ld + 5];
-              if (
-                point.x >= lcX - lhX && point.x <= lcX + lhX &&
-                point.y >= lcY - lhY && point.y <= lcY + lhY &&
-                point.z >= lcZ - lhZ && point.z <= lcZ + lhZ
-              ) {
-                recurse(L);
-                return;
-              }
-            }
-            const R = childRArr[nodeIndex];
-            if (R >= 0) {
-              const rd = R * 6;
-              const rcX = nodeData[rd], rcY = nodeData[rd + 1], rcZ = nodeData[rd + 2];
-              const rhX = nodeData[rd + 3], rhY = nodeData[rd + 4], rhZ = nodeData[rd + 5];
-              if (
-                point.x >= rcX - rhX && point.x <= rcX + rhX &&
-                point.y >= rcY - rhY && point.y <= rcY + rhY &&
-                point.z >= rcZ - rhZ && point.z <= rcZ + rhZ
-              ) {
-                recurse(R);
-                return;
-              }
-            }
+      const indices = leafContents[collidedLeafNodeIndex];
+      if (!indices || indices.length === 0) {
+        // no points in this leaf
+      } else {
+        let particleHit = -1;
+        const pxArr = currentPts.pos;
+        const prArr = currentPts.rad;
+        const pos = ballMesh.position;
+        for (let i = 0; i < indices.length; i++) {
+          const idx = indices[i];
+          const px = pxArr[3 * idx];
+          const py = pxArr[3 * idx + 1];
+          const pz = pxArr[3 * idx + 2];
+          const dx = pos.x - px;
+          const dy = pos.y - py;
+          const dz = pos.z - pz;
+          const distSq = dx * dx + dy * dy + dz * dz;
+          const radiusSum = ballRadius + prArr[idx];
+          if (distSq <= radiusSum * radiusSum) {
+            particleHit = idx;
+            break;
           }
         }
-        recurse(0);
-        return path;
+        if (particleHit < 0) {
+          // No orb‐collision yet; highlight current leaf
+          if (highlightBoxMesh && highlightedLeafIndex !== collidedLeafNodeIndex) {
+            highlightBoxMesh.dispose();
+            highlightBoxMesh = null;
+          }
+          if (!highlightBoxMesh || highlightedLeafIndex !== collidedLeafNodeIndex) {
+            const d = collidedLeafNodeIndex * 6;
+            const cx = nodeData[d], cy = nodeData[d + 1], cz = nodeData[d + 2];
+            const hx = nodeData[d + 3], hy = nodeData[d + 4], hz = nodeData[d + 5];
+            highlightBoxMesh = BABYLON.MeshBuilder.CreateBox(
+              "highlightBox",
+              { width: hx * 2, height: hy * 2, depth: hz * 2 },
+              scene
+            );
+            highlightBoxMesh.position.set(cx, cy, cz);
+            highlightBoxMesh.material = matHighlight;
+            highlightBoxMesh.renderingGroupId = 1;
+            highlightedLeafIndex = collidedLeafNodeIndex;
+          }
+          return;
+        }
       }
 
-      const hierarchyPath = collectHierarchy(ballMesh.position);
+      // --- Actual orb collision occurred! Build hierarchy path -----------
+      let hierarchyPath;
+      if (currentStructure === "bvh") {
+        hierarchyPath = collectHierarchyBVH(ballMesh.position);
+      } else {
+        hierarchyPath = collectHierarchyOct(ballMesh.position);
+      }
 
       // --- Build HTML table from hierarchyPath ---
       let html = `
@@ -961,10 +933,160 @@ function buildOctree(p, s, r, minLeaf, cubic) {
       isBallActive = false;
     });
 
-    /* ---------- render loop ---------------------------------------------- */
+    /* ---------- BVH path collector (binary children) ---------------------- */
+    function findLeafBVH(point) {
+      // Traverse from root (0) downward
+      let nodeIdx = 0;
+      while (true) {
+        if (isLeafArr[nodeIdx] === 1) {
+          return nodeIdx;
+        }
+        const d = nodeIdx * 6;
+        // left child
+        const L = childLArr[nodeIdx];
+        if (L >= 0) {
+          const ld = L * 6;
+          const lcX = nodeData[ld], lcY = nodeData[ld + 1], lcZ = nodeData[ld + 2];
+          const lhX = nodeData[ld + 3], lhY = nodeData[ld + 4], lhZ = nodeData[ld + 5];
+          if (
+            point.x >= lcX - lhX && point.x <= lcX + lhX &&
+            point.y >= lcY - lhY && point.y <= lcY + lhY &&
+            point.z >= lcZ - lhZ && point.z <= lcZ + lhZ
+          ) {
+            nodeIdx = L;
+            continue;
+          }
+        }
+        // else go right
+        const R = childRArr[nodeIdx];
+        if (R >= 0) {
+          const rd = R * 6;
+          const rcX = nodeData[rd], rcY = nodeData[rd + 1], rcZ = nodeData[rd + 2];
+          const rhX = nodeData[rd + 3], rhY = nodeData[rd + 4], rhZ = nodeData[rd + 5];
+          if (
+            point.x >= rcX - rhX && point.x <= rcX + rhX &&
+            point.y >= rcY - rhY && point.y <= rcY + rhY &&
+            point.z >= rcZ - rhZ && point.z <= rcZ + rhZ
+          ) {
+            nodeIdx = R;
+            continue;
+          }
+        }
+        // If neither child contains it, we’re outside the whole root or rounding errors
+        return -1;
+      }
+    }
+
+    function collectHierarchyBVH(point) {
+      const path = [];
+      let nodeIdx = 0;
+      while (true) {
+        path.push(nodeIdx);
+        if (isLeafArr[nodeIdx] === 1) {
+          break;
+        }
+        // same logic as findLeafBVH but record along the way
+        const d = nodeIdx * 6;
+        const L = childLArr[nodeIdx];
+        if (L >= 0) {
+          const ld = L * 6;
+          const lcX = nodeData[ld], lcY = nodeData[ld + 1], lcZ = nodeData[ld + 2];
+          const lhX = nodeData[ld + 3], lhY = nodeData[ld + 4], lhZ = nodeData[ld + 5];
+          if (
+            point.x >= lcX - lhX && point.x <= lcX + lhX &&
+            point.y >= lcY - lhY && point.y <= lcY + lhY &&
+            point.z >= lcZ - lhZ && point.z <= lcZ + lhZ
+          ) {
+            nodeIdx = L;
+            continue;
+          }
+        }
+        const R = childRArr[nodeIdx];
+        if (R >= 0) {
+          const rd = R * 6;
+          const rcX = nodeData[rd], rcY = nodeData[rd + 1], rcZ = nodeData[rd + 2];
+          const rhX = nodeData[rd + 3], rhY = nodeData[rd + 4], rhZ = nodeData[rd + 5];
+          if (
+            point.x >= rcX - rhX && point.x <= rcX + rhX &&
+            point.y >= rcY - rhY && point.y <= rcY + rhY &&
+            point.z >= rcZ - rhZ && point.z <= rcZ + rhZ
+          ) {
+            nodeIdx = R;
+            continue;
+          }
+        }
+        // no valid child → break
+        break;
+      }
+      return path;
+    }
+
+    /* ---------- Octree path collector (N-ary children) --------------------- */
+    function findLeafOct(point) {
+      // Traverse from root (0) downward
+      let nodeIdx = 0;
+      while (true) {
+        if (isLeafArr[nodeIdx] === 1) {
+          return nodeIdx;
+        }
+        const children = octChildrenIndices[nodeIdx];
+        let moved = false;
+        for (let i = 0, len = children.length; i < len; i++) {
+          const c = children[i];
+          const cd = c * 6;
+          const cx = nodeData[cd], cy = nodeData[cd + 1], cz = nodeData[cd + 2];
+          const hx = nodeData[cd + 3], hy = nodeData[cd + 4], hz = nodeData[cd + 5];
+          if (
+            point.x >= cx - hx && point.x <= cx + hx &&
+            point.y >= cy - hy && point.y <= cy + hy &&
+            point.z >= cz - hz && point.z <= cz + hz
+          ) {
+            nodeIdx = c;
+            moved = true;
+            break;
+          }
+        }
+        if (!moved) {
+          return -1;
+        }
+      }
+    }
+
+    function collectHierarchyOct(point) {
+      const path = [];
+      let nodeIdx = 0;
+      while (true) {
+        path.push(nodeIdx);
+        if (isLeafArr[nodeIdx] === 1) {
+          break;
+        }
+        const children = octChildrenIndices[nodeIdx];
+        let moved = false;
+        for (let i = 0, len = children.length; i < len; i++) {
+          const c = children[i];
+          const cd = c * 6;
+          const cx = nodeData[cd], cy = nodeData[cd + 1], cz = nodeData[cd + 2];
+          const hx = nodeData[cd + 3], hy = nodeData[cd + 4], hz = nodeData[cd + 5];
+          if (
+            point.x >= cx - hx && point.x <= cx + hx &&
+            point.y >= cy - hy && point.y <= cy + hy &&
+            point.z >= cz - hz && point.z <= cz + hz
+          ) {
+            nodeIdx = c;
+            moved = true;
+            break;
+          }
+        }
+        if (!moved) {
+          break;
+        }
+      }
+      return path;
+    }
+
+    /* ---------- render loop ----------------------------------------------- */
     engine.runRenderLoop(() => scene.render());
     window.addEventListener("resize", () => engine.resize());
   </script>
 </body>
-
 </html>
